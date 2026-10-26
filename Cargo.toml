@@ -61,7 +61,7 @@ chacha20poly1305 = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
 num-bigint = { version = "0.4", optional = true }
 uuid = { version = "1.29.0", features = ["v4"], optional = true }
-rubato = { version = "3", optional = true }
+rubato = { version = "5", optional = true }
 symphonia = { version = "0.6", optional = true, features = ["aac"] }
 
 # Error handling
@@ -93,7 +93,7 @@ tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serial_test = "3"
 cpal = "0.17"
-rubato = "3"
+rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 openh264 = "0.9.9"

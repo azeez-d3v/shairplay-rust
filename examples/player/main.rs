@@ -39,7 +39,7 @@ impl ExampleResampler {
         }
         let params = SincInterpolationParameters {
             sinc_len: 64,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
@@ -77,7 +77,7 @@ impl ExampleResampler {
                 }
             }
             if let Ok(input) = SequentialSliceOfVecs::new(&ch_vecs, self.channels, self.chunk_size)
-                && let Ok(result) = self.resampler.process(&input, 0, None)
+                && let Ok(result) = self.resampler.process(&input, None)
             {
                 output.extend(result.take_data());
             }
