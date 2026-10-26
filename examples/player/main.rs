@@ -449,7 +449,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ring_for_cpal = ring.clone();
 
             match device.build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let mut ring = ring_for_cpal.lock().unwrap();
                     for sample in data.iter_mut() {

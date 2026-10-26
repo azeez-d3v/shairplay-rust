@@ -91,13 +91,13 @@ hls = ["video"]
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serial_test = "3"
-cpal = "0.17"
+serial_test = "4.0.1"
+cpal = "0.18.2"
 rubato = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 openh264 = "0.9.9"
-minifb = "0.28"
+minifb = "0.29.0"
 
 [[example]]
 name = "player"
