@@ -32,7 +32,7 @@ include = [
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "signal", "io-util", "time"] }
+tokio = { version = "1.54.1", features = ["net", "rt-multi-thread", "sync", "macros", "signal", "io-util", "time"] }
 bytes = "1"
 
 # HTTP/RTSP parsing
@@ -54,18 +54,18 @@ subtle = "2" # constant-time comparison of authenticators/proofs
 
 # Encoding / parsing
 base64 = "0.22"
-plist = "1.9"
+plist = "1.10.3"
 
 # AirPlay 2 (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
 num-bigint = { version = "0.4", optional = true }
-uuid = { version = "1", features = ["v4"], optional = true }
+uuid = { version = "1.29.0", features = ["v4"], optional = true }
 rubato = { version = "3", optional = true }
 symphonia = { version = "0.6", optional = true, features = ["aac"] }
 
 # Error handling
-thiserror = "2"
+thiserror = "2.0.21"
 
 # Logging
 tracing = "0.1"
@@ -75,7 +75,7 @@ hex = "0.4"
 astro-dnssd = "0.3"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-mdns-sd = "0.21"
+mdns-sd = "0.21.6"
 gethostname = "1"
 
 [features]
@@ -89,14 +89,14 @@ video = ["ap2"]
 hls = ["video"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serial_test = "3"
 cpal = "0.17"
 rubato = "3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-openh264 = "0.9"
+serde_json = "1.0.154"
+openh264 = "0.9.9"
 minifb = "0.28"
 
 [[example]]
