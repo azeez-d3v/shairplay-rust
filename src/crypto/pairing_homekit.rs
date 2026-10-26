@@ -63,9 +63,9 @@ impl SrpServer {
     pub(crate) fn new(pin: Option<&str>) -> Result<Self, CryptoError> {
         // Random salt (16 bytes) and random 256-bit private value b.
         let mut salt_bytes = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut salt_bytes);
         let mut b_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut b_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut b_bytes);
         Self::with_entropy(pin, salt_bytes, b_bytes)
     }
 
@@ -380,7 +380,7 @@ pub fn identity_keypair(seed: &[u8; 32]) -> (SigningKey, VerifyingKey) {
 /// Generate a fresh random 32-byte Ed25519 identity seed from the OS CSPRNG.
 pub fn generate_identity_seed() -> [u8; 32] {
     let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     seed
 }
 
@@ -604,7 +604,7 @@ impl PairVerifyServer {
 
         // Generate ephemeral Curve25519 keypair
         let mut eph_sk_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut eph_sk_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut eph_sk_bytes);
         let static_secret = x25519_dalek::StaticSecret::from(eph_sk_bytes);
         let eph_pk = x25519_dalek::PublicKey::from(&static_secret);
 
@@ -789,7 +789,7 @@ mod tests {
         let g = BigUint::from(G_3072);
 
         let mut a_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut a_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut a_bytes);
         let a = BigUint::from_bytes_be(&a_bytes);
         let big_a = g.modpow(&a, &n);
 
@@ -907,7 +907,7 @@ mod tests {
         let n = BigUint::parse_bytes(N_3072_HEX.as_bytes(), 16).unwrap();
         let g = BigUint::from(G_3072);
         let mut a_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut a_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut a_bytes);
         let a = BigUint::from_bytes_be(&a_bytes);
         let big_a = g.modpow(&a, &n);
         let salt_bn = BigUint::from_bytes_be(salt);
@@ -932,7 +932,7 @@ mod tests {
         assert!(server.shared_secret().is_none()); // not transient → no secret yet
 
         // --- M5: Client sends encrypted device info ---
-        let client_sk = SigningKey::generate(&mut rand::thread_rng());
+        let client_sk = SigningKey::generate(&mut rand::rng());
         let client_vk = client_sk.verifying_key();
         let client_device_id = "MockClient01";
 
@@ -1020,7 +1020,7 @@ mod tests {
 
         // Client generates ephemeral key
         let mut client_eph_sk_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut client_eph_sk_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut client_eph_sk_bytes);
         let client_secret = x25519_dalek::StaticSecret::from(client_eph_sk_bytes);
         let client_eph_pk = x25519_dalek::PublicKey::from(&client_secret);
 
@@ -1088,7 +1088,7 @@ mod tests {
         let mut server = PairVerifyServer::new("VerifyDev01", &[0x42u8; 32]);
 
         let mut client_eph_sk_bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut client_eph_sk_bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut client_eph_sk_bytes);
         let client_secret = x25519_dalek::StaticSecret::from(client_eph_sk_bytes);
         let client_eph_pk = x25519_dalek::PublicKey::from(&client_secret);
 

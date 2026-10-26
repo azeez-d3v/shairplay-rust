@@ -39,8 +39,8 @@ bytes = "1"
 httparse = "1"
 
 # Crypto
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 rsa = "0.9"
 aes = "0.9"
 cbc = "0.2"
@@ -49,7 +49,7 @@ sha1 = "0.10" # stays on digest 0.10 until rsa 0.10 is stable: rsa 0.9 takes sha
 sha2 = "0.11"
 md-5 = "0.11"
 hmac = "0.13"
-rand = "0.8"
+rand = "0.10"
 subtle = "2" # constant-time comparison of authenticators/proofs
 
 # Encoding / parsing

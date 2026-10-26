@@ -491,7 +491,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             let mut mac = [0u8; 6];
             mac[0] = 0x02;
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut mac[1..]);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut mac[1..]);
             state.mac = Some(mac);
             if let Some(path) = &persist_path {
                 state.save(path);

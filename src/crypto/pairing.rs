@@ -1,7 +1,8 @@
 //! Ed25519/Curve25519 pair-setup and pair-verify for AP1.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use sha2::{Digest, Sha512};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -20,7 +21,7 @@ impl Pairing {
     /// Generate a new random pairing identity. Equivalent to pairing_init_generate.
     pub fn generate() -> Result<Self, CryptoError> {
         Ok(Self {
-            signing_key: SigningKey::generate(&mut OsRng),
+            signing_key: SigningKey::generate(&mut UnwrapErr(SysRng)),
         })
     }
 
@@ -94,7 +95,7 @@ impl PairingSession {
             return Err(CryptoError::PairingHandshake("already finished".into()));
         }
 
-        let our_secret = StaticSecret::random_from_rng(OsRng);
+        let our_secret = StaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
         let our_public = X25519PublicKey::from(&our_secret);
         let their_public = X25519PublicKey::from(*ecdh_key);
         let shared = our_secret.diffie_hellman(&their_public);

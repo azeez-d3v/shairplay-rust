@@ -1,7 +1,7 @@
 //! HTTP Digest authentication (RFC 2617) for optional password protection.
 
 use md5::{Digest, Md5};
-use rand::Rng;
+use rand::RngExt;
 use subtle::ConstantTimeEq;
 
 fn md5_to_hex(hash: &[u8; 16]) -> String {
@@ -53,8 +53,8 @@ fn get_response(
 
 /// Generate a random hex nonce string. Equivalent to digest_generate_nonce.
 pub fn generate_nonce(len: usize) -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: Vec<u8> = (0..16).map(|_| rng.r#gen()).collect();
+    let mut rng = rand::rng();
+    let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
     let mut h = Md5::new();
     h.update(&bytes);
     let hash: [u8; 16] = h.finalize().into();
