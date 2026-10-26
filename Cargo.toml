@@ -45,10 +45,10 @@ rsa = "0.9"
 aes = "0.9"
 cbc = "0.2"
 ctr = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
+sha1 = "0.10" # stays on digest 0.10 until rsa 0.10 is stable: rsa 0.9 takes sha1::Sha1 as its digest type parameter
+sha2 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
 rand = "0.8"
 subtle = "2" # constant-time comparison of authenticators/proofs
 
@@ -58,7 +58,7 @@ plist = "1.10.3"
 
 # AirPlay 2 (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
-hkdf = { version = "0.12", optional = true }
+hkdf = { version = "0.13", optional = true }
 num-bigint = { version = "0.4", optional = true }
 uuid = { version = "1.29.0", features = ["v4"], optional = true }
 rubato = { version = "5", optional = true }
