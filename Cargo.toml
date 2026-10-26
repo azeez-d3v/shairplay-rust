@@ -57,7 +57,7 @@ base64 = "0.22"
 plist = "1.10.3"
 
 # AirPlay 2 (optional)
-chacha20poly1305 = { version = "0.10", optional = true }
+chacha20poly1305 = { version = "0.11", optional = true }
 hkdf = { version = "0.13", optional = true }
 num-bigint = { version = "0.4", optional = true }
 uuid = { version = "1.29.0", features = ["v4"], optional = true }

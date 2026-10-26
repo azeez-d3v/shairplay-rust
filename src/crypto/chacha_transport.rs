@@ -296,16 +296,16 @@ mod tests {
     /// API used by this module.
     #[test]
     fn rfc8439_aead_vector() {
-        let key: Vec<u8> = (0x80u8..0xa0).collect();
-        let nonce = hex_decode("070000004041424344454647");
+        let key: [u8; 32] = std::array::from_fn(|i| 0x80 + i as u8);
+        let nonce: [u8; 12] = hex_decode("070000004041424344454647").try_into().unwrap();
         let aad = hex_decode("50515253c0c1c2c3c4c5c6c7");
         let plain = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
         let expected = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691";
 
-        let cipher = ChaCha20Poly1305::new(key.as_slice().into());
+        let cipher = ChaCha20Poly1305::new((&key).into());
         let ct = cipher
             .encrypt(
-                nonce.as_slice().into(),
+                (&nonce).into(),
                 Payload {
                     msg: plain,
                     aad: &aad,
@@ -316,7 +316,7 @@ mod tests {
 
         let pt = cipher
             .decrypt(
-                nonce.as_slice().into(),
+                (&nonce).into(),
                 Payload {
                     msg: &ct,
                     aad: &aad,
@@ -331,7 +331,7 @@ mod tests {
         assert!(
             cipher
                 .decrypt(
-                    nonce.as_slice().into(),
+                    (&nonce).into(),
                     Payload {
                         msg: &ct,
                         aad: &bad_aad,

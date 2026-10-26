@@ -343,9 +343,9 @@ fn encrypt_chacha(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from(*nonce_bytes);
     cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|_| CryptoError::PairingHandshake("ChaCha20 encrypt failed".into()))
 }
 
@@ -355,9 +355,9 @@ fn decrypt_chacha(
     ciphertext_with_tag: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
     let cipher = ChaCha20Poly1305::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from(*nonce_bytes);
     cipher
-        .decrypt(nonce, ciphertext_with_tag)
+        .decrypt(&nonce, ciphertext_with_tag)
         .map_err(|_| CryptoError::PairingHandshake("ChaCha20 decrypt failed".into()))
 }
 
