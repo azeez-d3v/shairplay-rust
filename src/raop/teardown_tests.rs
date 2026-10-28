@@ -8,6 +8,7 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 struct Handler {
+    volumes: Arc<std::sync::Mutex<Vec<(MediaSession, Option<f32>)>>>,
     audio: UnboundedSender<AudioTiming>,
     video: UnboundedSender<MediaSession>,
     flushes: Arc<AtomicUsize>,
@@ -29,9 +30,13 @@ impl AudioHandler for Handler {
     fn audio_init_encoded(
         &self,
         _: EncodedAudioFormat,
-        _: MediaSession,
+        session: MediaSession,
     ) -> Option<Box<dyn EncodedAudioSession>> {
+        self.volumes.lock().unwrap().push((session, None));
         Some(Box::new(Audio(self.audio.clone(), self.flushes.clone())))
+    }
+    fn on_volume_timed(&self, value: f32, session: MediaSession) {
+        self.volumes.lock().unwrap().push((session, Some(value)));
     }
     fn on_media_session_ended(&self, _: MediaSession) {
         self.ended.fetch_add(1, Ordering::SeqCst);
@@ -68,6 +73,7 @@ impl HttpdCallbacks for Callbacks {
         remote: std::net::SocketAddr,
     ) -> Option<Box<dyn ConnectionHandler>> {
         let mut conn = crate::raop::connection::new_raop_connection(self.0.clone(), local, remote);
+        conn.authenticated_peer = Some([1; 32]);
         conn.ekey = Some([0; 16]);
         conn.eiv = Some([0; 16]);
         Some(Box::new(Connection(conn)))
@@ -79,6 +85,7 @@ impl ConnectionHandler for Connection {
     }
 }
 struct Harness {
+    volumes: Arc<std::sync::Mutex<Vec<(MediaSession, Option<f32>)>>>,
     server: RaopServer,
     http: HttpServer,
     rtsp: TcpStream,
@@ -93,7 +100,9 @@ impl Harness {
         let (vtx, video) = mpsc::unbounded_channel();
         let flushes = Arc::new(AtomicUsize::new(0));
         let ended = Arc::new(AtomicUsize::new(0));
+        let volumes = Arc::new(std::sync::Mutex::new(vec![]));
         let handler = Arc::new(Handler {
+            volumes: volumes.clone(),
             audio: atx,
             video: vtx,
             flushes: flushes.clone(),
@@ -103,7 +112,7 @@ impl Harness {
             .video_handler(handler.clone())
             .build(handler)
             .unwrap();
-        let mut http = HttpServer::new(Arc::new(Callbacks(server.shared.clone())), 2);
+        let mut http = HttpServer::new(Arc::new(Callbacks(server.shared.clone())), 3);
         http.set_bind_config(
             BindConfig::new()
                 .addrs(["127.0.0.1".parse().unwrap()])
@@ -112,6 +121,7 @@ impl Harness {
         let port = http.start(0).await.unwrap();
         let rtsp = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         Self {
+            volumes,
             server,
             http,
             rtsp,
@@ -122,8 +132,18 @@ impl Harness {
         }
     }
     async fn request(&mut self, method: &str, body: &[u8]) -> (String, Vec<u8>) {
+        let flush = if method == "FLUSH" {
+            "RTP-Info: seq=50\r\n"
+        } else {
+            ""
+        };
+        let content_type = if method.ends_with("_PARAMETER") {
+            "text/parameters"
+        } else {
+            "application/x-apple-binary-plist"
+        };
         let wire = format!(
-            "{method} / RTSP/1.0\r\nCSeq: 1\r\nContent-Type: application/x-apple-binary-plist\r\nContent-Length: {}\r\n\r\n",
+            "{method} / RTSP/1.0\r\nCSeq: 1\r\n{flush}Content-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         self.rtsp.write_all(wire.as_bytes()).await.unwrap();
@@ -348,5 +368,246 @@ async fn malformed_typed_teardown_is_rejected_without_stopping_media() {
         assert_eq!(marker(&mut video, &mut h.video).await, original);
     }
     assert_eq!(h.ended.load(Ordering::SeqCst), 0);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn audio_takeover_fences_old_auxiliary_connection_and_late_teardown() {
+    for teardown in [None, Some(false), Some(true)] {
+        let mut h = Harness::start().await;
+        let address = h.rtsp.peer_addr().unwrap();
+        let (vport, _) = h.setup(110).await;
+        let mut video = TcpStream::connect(("127.0.0.1", vport)).await.unwrap();
+        let original = marker(&mut video, &mut h.video).await;
+        let mut video_control = TcpStream::connect(address).await.unwrap();
+        std::mem::swap(&mut h.rtsp, &mut video_control);
+        let (old_port, old_control) = h.setup(96).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sync(&sender, old_control, 0, 100).await;
+        assert_eq!(
+            send_audio(&sender, old_port, 0, 0, &mut h.audio)
+                .await
+                .session,
+            original
+        );
+
+        let mut old_connection = TcpStream::connect(address).await.unwrap();
+        std::mem::swap(&mut h.rtsp, &mut old_connection);
+        let (new_port, new_control) = h.setup(96).await;
+        assert_eq!(
+            h.flushes.load(Ordering::SeqCst),
+            1,
+            "takeover must finish old audio before new factory"
+        );
+        sync(&sender, new_control, 9_000_000, 102).await;
+        let fresh = send_audio(&sender, new_port, 10, 9_000_000, &mut h.audio).await;
+        assert_eq!(fresh.session, original);
+        assert_eq!(fresh.presentation_time_ns, Some(102_000_000_000));
+
+        // Delayed UDP callbacks and sync from the displaced auxiliary connection cannot affect B.
+        let mut stale = [0u8; 16];
+        stale[0] = 0x80;
+        stale[1] = 0x60;
+        stale[3] = 1;
+        stale[12..].fill(0xab);
+        sender
+            .send_to(&stale, ("127.0.0.1", old_port))
+            .await
+            .unwrap();
+        sync(&sender, old_control, 0, 900).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), h.audio.recv())
+                .await
+                .is_err()
+        );
+        std::mem::swap(&mut h.rtsp, &mut old_connection);
+        assert!(h.request("FLUSH", &[]).await.0.contains("200 OK"));
+        if let Some(full) = teardown {
+            let payload = if full { vec![] } else { body(vec![stream(96)]) };
+            assert!(h.request("TEARDOWN", &payload).await.0.contains("200 OK"));
+        }
+        std::mem::swap(&mut h.rtsp, &mut old_connection);
+        drop(old_connection);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            h.flushes.load(Ordering::SeqCst),
+            1,
+            "old FLUSH/TEARDOWN/close must not flush replacement"
+        );
+        let resumed = send_audio(&sender, new_port, 11, 9_000_480, &mut h.audio).await;
+        assert_eq!(
+            resumed.presentation_time_ns,
+            Some(102_000_000_000 + 480_000_000_000 / 44100)
+        );
+        assert_eq!(marker(&mut video, &mut h.video).await, original);
+        assert_eq!(h.ended.load(Ordering::SeqCst), 0);
+        h.shutdown().await;
+        drop(video_control);
+    }
+}
+
+#[tokio::test]
+async fn volume_parameters_report_cached_value_and_reject_invalid_levels() {
+    let mut h = Harness::start().await;
+    assert_eq!(
+        h.request("GET_PARAMETER", b"volume\r\n").await.1,
+        b"volume: 0.000000\r\n"
+    );
+    for (wire, expected) in [
+        ("-144", "-144.000000"),
+        ("-12.5", "-12.500000"),
+        ("0", "0.000000"),
+    ] {
+        assert!(
+            h.request("SET_PARAMETER", format!("volume: {wire}\r\n").as_bytes())
+                .await
+                .0
+                .contains("200 OK")
+        );
+        assert_eq!(
+            h.request("GET_PARAMETER", b"volume\r\n").await.1,
+            format!("volume: {expected}\r\n").as_bytes()
+        );
+    }
+    for value in ["NaN", "inf", "-inf", "1", "-145", "bad"] {
+        assert!(
+            h.request("SET_PARAMETER", format!("volume: {value}\r\n").as_bytes())
+                .await
+                .0
+                .contains("400 Bad Request"),
+            "{value}"
+        );
+        assert_eq!(
+            h.request("GET_PARAMETER", b"volume\r\n").await.1,
+            b"volume: 0.000000\r\n"
+        );
+    }
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn volume_preinit_takeover_and_retired_control_identity() {
+    let mut h = Harness::start().await;
+    let address = h.rtsp.peer_addr().unwrap();
+    assert_eq!(
+        h.request("GET_PARAMETER", b"volume\r\n").await.1,
+        b"volume: 0.000000\r\n"
+    );
+    assert!(
+        h.volumes.lock().unwrap().is_empty(),
+        "default GET must not emit unsolicited volume"
+    );
+    h.request("SET_PARAMETER", b"volume: -144\r\n").await;
+    let (vport, _) = h.setup(110).await;
+    let mut video = TcpStream::connect(("127.0.0.1", vport)).await.unwrap();
+    let identity = marker(&mut video, &mut h.video).await;
+    h.setup(96).await;
+    assert!(
+        h.volumes
+            .lock()
+            .unwrap()
+            .ends_with(&[(identity, None), (identity, Some(-144.0))])
+    );
+    let mut control = TcpStream::connect(address).await.unwrap();
+    std::mem::swap(&mut h.rtsp, &mut control);
+    h.setup(96).await;
+    assert!(
+        h.volumes
+            .lock()
+            .unwrap()
+            .ends_with(&[(identity, None), (identity, Some(-144.0))]),
+        "replacement factory must retain explicit mute"
+    );
+    std::mem::swap(&mut h.rtsp, &mut control);
+    assert!(
+        h.request("SET_PARAMETER", b"volume: -12\r\n")
+            .await
+            .0
+            .contains("200 OK"),
+        "control remains valid after its audio ownership is retired"
+    );
+    std::mem::swap(&mut h.rtsp, &mut control);
+    assert_eq!(
+        h.request("GET_PARAMETER", b"volume\r\n").await.1,
+        b"volume: -12.000000\r\n"
+    );
+    std::mem::swap(&mut h.rtsp, &mut control);
+    h.request("TEARDOWN", &body(vec![stream(110)])).await;
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), video.read(&mut [0]))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    let events = h.volumes.lock().unwrap().len();
+    assert!(
+        h.request("SET_PARAMETER", b"volume: 0\r\n")
+            .await
+            .0
+            .contains("454 Session Not Found")
+    );
+    let mut old = TcpStream::connect(address).await.unwrap();
+    std::mem::swap(&mut h.rtsp, &mut old);
+    assert_eq!(
+        h.request("GET_PARAMETER", b"volume\r\n").await.1,
+        b"volume: 0.000000\r\n"
+    );
+    std::mem::swap(&mut h.rtsp, &mut old);
+    assert!(
+        h.request("SET_PARAMETER", b"volume: -144\r\n")
+            .await
+            .0
+            .contains("454 Session Not Found")
+    );
+    std::mem::swap(&mut h.rtsp, &mut old);
+    assert_eq!(
+        h.volumes.lock().unwrap().len(),
+        events,
+        "retired context must not emit callback into replacement"
+    );
+    h.setup(96).await;
+    let recorded = h.volumes.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        events + 1,
+        "new context without SET emits only factory, no implicit volume0"
+    );
+    assert_eq!(recorded.last().unwrap().1, None);
+    assert_ne!(recorded.last().unwrap().0, identity);
+    h.shutdown().await;
+    drop((control, old));
+}
+
+#[tokio::test]
+async fn volume_admission_racing_retirement_keeps_original_context() {
+    use crate::raop::handlers_ap1::volume_context_admit;
+    let h = Harness::start().await;
+    let endpoint = "127.0.0.1:1".parse().unwrap();
+    let mut conn =
+        crate::raop::connection::new_raop_connection(h.server.shared.clone(), endpoint, endpoint);
+    conn.authenticated_peer = Some([1; 32]);
+    assert!(conn.admit_media());
+    let original = conn.media.clone();
+    let video = original.video_lease().unwrap();
+    // EOF retires the original after the first liveness check, just before
+    // registry admission acquires its mutex. No timing/sleep assumption.
+    assert!(!volume_context_admit(&mut conn, |conn| {
+        drop(video);
+        assert!(conn.admit_media());
+        assert!(!Arc::ptr_eq(&original, &conn.media));
+        true
+    }));
+    assert!(Arc::ptr_eq(&original, &conn.media));
+    assert!(
+        !volume_context_admit(&mut conn, |conn| conn.admit_media()),
+        "rejected admission must not persist"
+    );
+    let mut fresh =
+        crate::raop::connection::new_raop_connection(h.server.shared.clone(), endpoint, endpoint);
+    fresh.authenticated_peer = Some([1; 32]);
+    assert!(volume_context_admit(&mut fresh, |conn| conn.admit_media()));
+    assert_ne!(original.session(), fresh.media.session());
+    assert_eq!(fresh.media.volume(), 0.0);
     h.shutdown().await;
 }

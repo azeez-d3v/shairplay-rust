@@ -87,6 +87,7 @@ pub(crate) fn spawn_ntp_responder(
     media: std::sync::Arc<super::media::MediaContext>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut probe = super::diagnostics::NtpProbe::new(remote_timing.port() != 0);
         let mut buf = [0u8; 128];
         let mut pending = std::collections::VecDeque::with_capacity(3);
 
@@ -119,7 +120,11 @@ pub(crate) fn spawn_ntp_responder(
                     pending.pop_front();
                 }
                 pending.push_back((u64::from(s) << 32) | u64::from(f));
-                let _ = tsock.send_to(&req, remote_timing).await;
+                if tsock.send_to(&req, remote_timing).await.is_ok() {
+                    probe.sent += 1;
+                } else {
+                    probe.io_errors += 1;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
@@ -128,8 +133,14 @@ pub(crate) fn spawn_ntp_responder(
             let timeout = tokio::time::sleep(std::time::Duration::from_secs(3));
             tokio::select! {
                 result = tsock.recv_from(&mut buf) => {
+                    if let Ok((_,addr)) = &result {
+                        probe.received += 1;
+                        if *addr != remote_timing { probe.source_mismatch += 1; }
+                        if addr.is_ipv6() != remote_timing.is_ipv6() { probe.cross_family += 1; }
+                    }
                     match result {
                         Ok((len, addr)) if addr == remote_timing && len == 32 && buf[0] >> 6 == 2 && buf[1] & 0x7f == 0x52 => {
+                            probe.requests += 1;
                             // Timing request — send response
                             let mut resp = [0u8; 32];
                             resp[..32].copy_from_slice(&buf[..32]);
@@ -138,14 +149,17 @@ pub(crate) fn spawn_ntp_responder(
                             let (s, f) = ntp_now();
                             put_ntp(&mut resp, 16, s, f);
                             put_ntp(&mut resp, 24, s, f);
-                            let _ = tsock.send_to(&resp, addr).await;
+                            if tsock.send_to(&resp, addr).await.is_ok() { probe.replies += 1; } else { probe.io_errors += 1; }
                         }
                         Ok((32, addr)) if addr == remote_timing && buf[1] & 0x7f == 0x53 => {
+                            probe.responses += 1;
                             let origin = u64::from_be_bytes(buf[8..16].try_into().unwrap());
                             if let Some(index) = pending.iter().position(|request| *request == origin) {
+                                probe.matched += 1;
                                 pending.remove(index);
                                 let (s,f) = ntp_now();
                                 if let Some(offset) = timing_estimate(&buf[..32], origin, (u64::from(s)<<32)|u64::from(f)) {
+                                    probe.valid += 1;
                                     let mut clock = media.clock.lock().unwrap_or_else(|e|e.into_inner());
                                     if clock.receiver_offset_ns.is_none_or(|previous| previous.abs_diff(offset)<20_000_000) {
                                         clock.receiver_offset_ns=Some(offset);
@@ -154,7 +168,7 @@ pub(crate) fn spawn_ntp_responder(
                             }
                         }
                         Ok(_) => {}
-                        Err(_) => break,
+                        Err(_) => { probe.io_errors += 1; break; },
                     }
                 }
                 _ = timeout => {
@@ -168,7 +182,7 @@ pub(crate) fn spawn_ntp_responder(
                         put_ntp(&mut req, 24, s, f);
                         if pending.len() == 3 { pending.pop_front(); }
                         pending.push_back((u64::from(s)<<32)|u64::from(f));
-                        let _ = tsock.send_to(&req, remote_timing).await;
+                        if tsock.send_to(&req, remote_timing).await.is_ok() { probe.sent += 1; } else { probe.io_errors += 1; }
                     }
                 }
             }

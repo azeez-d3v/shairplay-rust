@@ -2,13 +2,23 @@
 use super::{MediaSession, ntp::SenderClock};
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicU8, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 const RETIRING: u8 = 2;
 const RETIRED: u8 = 3;
 
+#[derive(Default)]
+struct VolumeState {
+    value: Option<f32>,
+    dirty: bool,
+    delivering: bool,
+}
+
 pub(crate) struct MediaContext {
+    volume: Mutex<VolumeState>,
+    audio_setup: AtomicBool,
+    audio_owner: Mutex<Weak<super::rtp::AudioOwner>>,
     handler: Mutex<Option<Arc<dyn super::AudioHandler>>>,
     video_state: AtomicU8,
     transports: Mutex<Vec<tokio::task::AbortHandle>>,
@@ -23,6 +33,9 @@ impl Default for MediaContext {
     fn default() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
+            volume: Mutex::default(),
+            audio_setup: AtomicBool::new(false),
+            audio_owner: Mutex::new(Weak::new()),
             handler: Mutex::new(None),
             video_state: AtomicU8::new(0),
             transports: Mutex::new(Vec::new()),
@@ -36,6 +49,86 @@ impl Default for MediaContext {
     }
 }
 impl MediaContext {
+    pub(crate) fn accepts_control(&self) -> bool {
+        self.video_state.load(Ordering::Acquire) < RETIRING
+    }
+    pub(crate) fn volume(&self) -> f32 {
+        self.volume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .value
+            .unwrap_or(0.0)
+    }
+    pub(crate) fn set_volume(
+        self: &Arc<Self>,
+        value: f32,
+        handler: &dyn super::AudioHandler,
+    ) -> bool {
+        if !value.is_finite() || !(-144.0..=0.0).contains(&value) {
+            return false;
+        }
+        {
+            let mut state = self.volume.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.accepts_control() {
+                return false;
+            }
+            state.value = Some(value);
+            state.dirty = true;
+            if state.delivering {
+                return true;
+            }
+            state.delivering = true;
+        }
+        VolumeDelivery {
+            media: self.clone(),
+            active: true,
+        }
+        .drain(handler);
+        true
+    }
+    fn reserve_volume(self: &Arc<Self>) -> Option<VolumeDelivery> {
+        let mut state = self.volume.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.accepts_control() || state.delivering {
+            return None;
+        }
+        state.delivering = true;
+        state.dirty = state.value.is_some();
+        Some(VolumeDelivery {
+            media: self.clone(),
+            active: true,
+        })
+    }
+
+    /// Only one auxiliary connection may replace this phone's audio at a time.
+    /// Reject concurrent/reentrant setup rather than holding a mutex across host callbacks.
+    pub(crate) fn begin_audio_setup(self: &Arc<Self>) -> Option<AudioSetup> {
+        if self.video_state.load(Ordering::Acquire) >= RETIRING
+            || self
+                .audio_setup
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        let mut reservation = AudioSetup {
+            media: self.clone(),
+            volume: None,
+        };
+        reservation.volume = Some(self.reserve_volume()?);
+        let previous = self
+            .audio_owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if previous.is_some_and(|owner| !owner.stop()) {
+            return None;
+        }
+        Some(reservation)
+    }
+    pub(crate) fn own_audio(&self, owner: &Arc<super::rtp::AudioOwner>) {
+        *self.audio_owner.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(owner);
+    }
+
     #[cfg(all(test, feature = "video"))]
     pub(crate) fn is_retired(&self) -> bool {
         self.video_state.load(Ordering::Acquire) == RETIRED
@@ -100,6 +193,58 @@ impl MediaContext {
                 generation.checked_add(1)
             })
             .expect("media generation exhausted");
+    }
+}
+/// One pending value, not an event queue; callbacks run outside the cache mutex.
+struct VolumeDelivery {
+    media: Arc<MediaContext>,
+    active: bool,
+}
+impl VolumeDelivery {
+    fn drain(mut self, handler: &dyn super::AudioHandler) {
+        loop {
+            let value = {
+                let mut state = self.media.volume.lock().unwrap_or_else(|e| e.into_inner());
+                if !state.dirty || !self.media.accepts_control() {
+                    state.delivering = false;
+                    self.active = false;
+                    return;
+                }
+                state.dirty = false;
+                state.value
+            };
+            if let Some(value) = value {
+                handler.on_volume_timed(value, self.media.session());
+            }
+        }
+    }
+}
+impl Drop for VolumeDelivery {
+    fn drop(&mut self) {
+        if self.active {
+            self.media
+                .volume
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .delivering = false;
+        }
+    }
+}
+pub(crate) struct AudioSetup {
+    media: Arc<MediaContext>,
+    volume: Option<VolumeDelivery>,
+}
+impl AudioSetup {
+    pub(crate) fn replay_volume(&mut self, handler: &dyn super::AudioHandler) {
+        if let Some(volume) = self.volume.take() {
+            volume.drain(handler);
+        }
+    }
+}
+impl Drop for AudioSetup {
+    fn drop(&mut self) {
+        self.volume.take();
+        self.media.audio_setup.store(false, Ordering::Release);
     }
 }
 #[derive(Default)]
@@ -189,6 +334,130 @@ mod tests {
         drop(a);
         drop(b);
         assert!(registry.acquire([2; 32]).is_some());
+    }
+
+    #[derive(Default)]
+    struct VolumeRecorder(Mutex<Vec<f32>>);
+    impl super::super::AudioHandler for VolumeRecorder {
+        fn audio_init(&self, _: super::super::AudioFormat) -> Box<dyn super::super::AudioSession> {
+            unreachable!()
+        }
+        fn on_volume_timed(&self, value: f32, _: MediaSession) {
+            self.0.lock().unwrap().push(value);
+        }
+    }
+    #[test]
+    fn volume_setup_reservation_replays_latest_before_release_and_survives_failure() {
+        let media = Arc::new(MediaContext::default());
+        let handler = VolumeRecorder::default();
+        // No SET means default GET=0, but must not trigger a legacy callback.
+        let mut setup = media.begin_audio_setup().unwrap();
+        setup.replay_volume(&handler);
+        drop(setup);
+        assert!(handler.0.lock().unwrap().is_empty());
+        assert!(media.set_volume(-12.0, &handler));
+        handler.0.lock().unwrap().clear();
+        let failed = media.begin_audio_setup().unwrap();
+        // Models SET while a factory is running, then an unsuccessful factory.
+        assert!(media.set_volume(-144.0, &handler));
+        assert!(handler.0.lock().unwrap().is_empty());
+        drop(failed);
+        let mut retry = media.begin_audio_setup().unwrap();
+        assert!(media.set_volume(-6.0, &handler));
+        assert!(media.set_volume(-144.0, &handler));
+        assert!(handler.0.lock().unwrap().is_empty());
+        // Production calls this after the successful factory, before task spawn.
+        retry.replay_volume(&handler);
+        assert_eq!(*handler.0.lock().unwrap(), [-144.0]);
+        assert!(
+            media.begin_audio_setup().is_none(),
+            "factory reservation is still held"
+        );
+        drop(retry);
+        assert!(media.begin_audio_setup().is_some());
+    }
+    #[test]
+    fn volume_concurrent_updates_coalesce_and_setup_cannot_overtake_callback() {
+        use std::sync::mpsc;
+        struct Blocking {
+            events: Mutex<Vec<f32>>,
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl super::super::AudioHandler for Blocking {
+            fn audio_init(
+                &self,
+                _: super::super::AudioFormat,
+            ) -> Box<dyn super::super::AudioSession> {
+                unreachable!()
+            }
+            fn on_volume_timed(&self, value: f32, _: MediaSession) {
+                self.events.lock().unwrap().push(value);
+                if value == -12.0 {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+            }
+        }
+        let media = Arc::new(MediaContext::default());
+        let (entered, arrived) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let handler = Arc::new(Blocking {
+            events: Mutex::default(),
+            entered,
+            release: Mutex::new(gate),
+        });
+        let worker = {
+            let media = media.clone();
+            let handler = handler.clone();
+            std::thread::spawn(move || media.set_volume(-12.0, &*handler))
+        };
+        arrived
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let cached = media.set_volume(-9.0, &*handler) && media.set_volume(-144.0, &*handler);
+        let before_release = handler.events.lock().unwrap().clone();
+        let rejected_setup = media.begin_audio_setup().is_none();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap());
+        assert!(cached && rejected_setup);
+        assert_eq!(before_release, [-12.0]);
+        assert_eq!(*handler.events.lock().unwrap(), [-12.0, -144.0]);
+        assert_eq!(media.volume(), -144.0);
+        let mut setup = media.begin_audio_setup().unwrap();
+        setup.replay_volume(&*handler);
+        assert_eq!(*handler.events.lock().unwrap(), [-12.0, -144.0, -144.0]);
+    }
+    #[test]
+    fn volume_reentrant_set_is_drained_after_current_callback_without_locking_host() {
+        struct Reentrant {
+            media: Arc<MediaContext>,
+            values: Mutex<Vec<f32>>,
+        }
+        impl super::super::AudioHandler for Reentrant {
+            fn audio_init(
+                &self,
+                _: super::super::AudioFormat,
+            ) -> Box<dyn super::super::AudioSession> {
+                unreachable!()
+            }
+            fn on_volume_timed(&self, value: f32, _: MediaSession) {
+                self.values.lock().unwrap().push(value);
+                if value == -12.0 {
+                    assert!(self.media.set_volume(-144.0, self));
+                    assert!(self.media.begin_audio_setup().is_none());
+                }
+            }
+        }
+        let media = Arc::new(MediaContext::default());
+        let handler = Reentrant {
+            media: media.clone(),
+            values: Mutex::default(),
+        };
+        assert!(media.set_volume(-12.0, &handler));
+        assert_eq!(*handler.values.lock().unwrap(), [-12.0, -144.0]);
+        assert_eq!(media.volume(), -144.0);
+        assert!(media.begin_audio_setup().is_some());
     }
     #[tokio::test]
     async fn tracked_tasks_are_joined_and_drop_resources() {

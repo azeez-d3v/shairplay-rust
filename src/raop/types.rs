@@ -184,6 +184,12 @@ pub trait AudioHandler: Send + Sync + 'static {
 
     /// Volume change in dB (0.0 = max, -144.0 = mute).
     fn on_volume(&self, _volume: f32) {}
+    /// Session-aware sender volume in dB; defaults to the legacy callback.
+    /// RTP receivers replay explicitly set volume after their factory, before packets.
+    /// No initial callback is emitted until the sender sets a volume.
+    fn on_volume_timed(&self, volume: f32, _session: MediaSession) {
+        self.on_volume(volume);
+    }
     /// Track metadata (parsed from DMAP).
     fn on_metadata(&self, _metadata: &crate::proto::dmap::TrackMetadata) {}
     /// Album artwork (JPEG or PNG).
@@ -335,4 +341,30 @@ pub trait RemoteControl: Send + Sync {
     fn send_command(&self, cmd: RemoteCommand) -> Result<(), crate::error::ShairplayError>;
     /// Commands the source device supports. AP1 returns all; AP2 returns advertised set.
     fn available_commands(&self) -> Vec<RemoteCommand>;
+}
+
+#[cfg(test)]
+mod volume_compat_tests {
+    use super::*;
+    struct Legacy(std::sync::Mutex<Vec<f32>>);
+    impl AudioHandler for Legacy {
+        fn audio_init(&self, _: AudioFormat) -> Box<dyn AudioSession> {
+            unreachable!()
+        }
+        fn on_volume(&self, value: f32) {
+            self.0.lock().unwrap().push(value);
+        }
+    }
+    #[test]
+    fn timed_volume_default_preserves_legacy_callback() {
+        let handler = Legacy(std::sync::Mutex::new(vec![]));
+        handler.on_volume_timed(
+            -12.0,
+            MediaSession {
+                id: 1,
+                generation: 0,
+            },
+        );
+        assert_eq!(*handler.0.lock().unwrap(), vec![-12.0]);
+    }
 }

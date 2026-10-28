@@ -724,6 +724,28 @@ fn setup_stream_realtime(
         bit_depth: 16,
         channels: 2,
     });
+    super::diagnostics::emit(format_args!(
+        "stage=audio_setup ct={} sr={} spf={} audio_format={} is_media={} using_screen={} remote_control_port_present={}",
+        stream0
+            .get("ct")
+            .and_then(plist::Value::as_unsigned_integer)
+            .unwrap_or(2),
+        sr,
+        spf,
+        audio_format,
+        stream0
+            .get("isMedia")
+            .and_then(plist::Value::as_boolean)
+            .unwrap_or(false),
+        stream0
+            .get("usingScreen")
+            .and_then(plist::Value::as_boolean)
+            .unwrap_or(false),
+        stream0
+            .get("controlPort")
+            .and_then(plist::Value::as_unsigned_integer)
+            .is_some_and(|port| port != 0)
+    ));
     let shk = stream0.get("shk").and_then(|v| v.as_data()).unwrap_or(&[]);
 
     if shk.len() == 32 {

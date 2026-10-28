@@ -451,9 +451,41 @@ pub(crate) fn handle_record(
     None
 }
 
+// A control socket may outlive/rejoin an audio transport, but an already retired
+// media context must never be silently rebound by a late volume command.
+fn volume_context(conn: &mut RaopConnection) -> bool {
+    volume_context_admit(conn, |conn| {
+        #[cfg(feature = "ap2")]
+        {
+            conn.admit_media()
+        }
+        #[cfg(not(feature = "ap2"))]
+        {
+            let _ = conn;
+            true
+        }
+    })
+}
+pub(super) fn volume_context_admit(
+    conn: &mut RaopConnection,
+    admit: impl FnOnce(&mut RaopConnection) -> bool,
+) -> bool {
+    let original = conn.media.clone();
+    if !original.accepts_control() {
+        return false;
+    }
+    if !admit(conn) || !original.accepts_control() {
+        // Registry admission can race EOF and return the replacement context.
+        // Reject the late command without leaving this socket rebound to it.
+        conn.media = original;
+        return false;
+    }
+    true
+}
+
 /// RTSP GET_PARAMETER: return volume or other parameters.
 pub(crate) fn handle_get_parameter(
-    _conn: &mut RaopConnection,
+    conn: &mut RaopConnection,
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
@@ -465,8 +497,12 @@ pub(crate) fn handle_get_parameter(
     let data = request.data()?;
     let text = std::str::from_utf8(data).ok()?;
     if text.contains("volume") {
+        if !volume_context(conn) {
+            *response = HttpResponse::new("RTSP/1.0", 454, "Session Not Found");
+            return None;
+        }
         response.add_header("Content-Type", "text/parameters");
-        return Some(b"volume: 0.000000\r\n".to_vec());
+        return Some(format!("volume: {:.6}\r\n", conn.media.volume()).into_bytes());
     }
     None
 }
@@ -475,7 +511,7 @@ pub(crate) fn handle_get_parameter(
 pub(crate) fn handle_set_parameter(
     conn: &mut RaopConnection,
     request: &HttpRequest,
-    _response: &mut HttpResponse,
+    response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
     let content_type = request.header("Content-Type")?;
     let data = request.data()?;
@@ -489,8 +525,16 @@ pub(crate) fn handle_set_parameter(
         "text/parameters" => {
             let text = std::str::from_utf8(data).ok()?;
             if let Some(rest) = text.strip_prefix("volume: ") {
-                if let Ok(vol) = rest.trim().parse::<f32>() {
-                    conn.shared.handler.on_volume(vol);
+                let Ok(volume) = rest.trim().parse::<f32>() else {
+                    *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                    return None;
+                };
+                if !volume.is_finite() || !(-144.0..=0.0).contains(&volume) {
+                    *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+                } else if !volume_context(conn)
+                    || !conn.media.set_volume(volume, &*conn.shared.handler)
+                {
+                    *response = HttpResponse::new("RTSP/1.0", 454, "Session Not Found");
                 }
             } else if let Some(rest) = text.strip_prefix("progress: ") {
                 let parts: Vec<&str> = rest.trim().split('/').collect();

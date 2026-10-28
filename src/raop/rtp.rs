@@ -13,7 +13,10 @@
 //!   No retransmits (reliable transport).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU8, Ordering},
+};
 
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{Mutex, watch};
@@ -123,7 +126,51 @@ pub(crate) struct RtpEncryption {
 ///
 /// Dropped when the RTSP connection closes, which sends a shutdown signal
 /// to the receive task via the [`watch`] channel.
+/// One connection's audio lifetime, shared only through its authenticated media context.
+/// The callback Option fences old packets; the lifecycle also fences late stop/FLUSH actions.
+pub(crate) struct AudioOwner {
+    state: AtomicU8,
+    session: Arc<std::sync::Mutex<Option<StreamSession>>>,
+    children: Vec<tokio::task::AbortHandle>,
+    shutdown: watch::Sender<bool>,
+    media: Weak<super::media::MediaContext>,
+}
+impl AudioOwner {
+    pub(crate) fn stop(&self) -> bool {
+        match self
+            .state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(2) => return true,
+            Err(_) => return false, // A host flush is still running; a new factory must wait/retry.
+        }
+        let _ = self.shutdown.send(true);
+        for child in &self.children {
+            child.abort();
+        }
+        let session = self
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut session) = session
+            && let Some(media) = self.media.upgrade()
+        {
+            media
+                .clock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset();
+            session.audio_flush_timed(media.session());
+        }
+        self.state.store(2, Ordering::Release);
+        true
+    }
+}
+
 pub(crate) struct RaopRtp {
+    owner: Option<Arc<AudioOwner>>,
     encoded_format: Option<super::EncodedAudioFormat>,
     wire_codec: super::WireAudioCodec,
     flush_notify: Arc<tokio::sync::Notify>,
@@ -194,6 +241,7 @@ impl RaopRtp {
         }?;
         let format = buffer.format();
         Some(Self {
+            owner: None,
             wire_codec: config.encoded_format.as_ref().map_or_else(
                 || {
                     if config.rtpmap.to_ascii_lowercase().contains("applelossless") {
@@ -271,6 +319,11 @@ impl RaopRtp {
         timing_rport: u16,
     ) -> Result<(u16, u16, u16), ShairplayError> {
         self.stop();
+        let mut reservation = self.media.begin_audio_setup().ok_or_else(|| {
+            crate::error::ProtocolError::InvalidRtsp(
+                "media audio replacement is busy or retired".into(),
+            )
+        })?;
         self.control_rport = control_rport;
         info!(use_udp, control_rport, timing_rport, remote = %self.remote, "AP1 RTP starting");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -287,6 +340,7 @@ impl RaopRtp {
 
             let session = Arc::new(std::sync::Mutex::new(Some(self.create_session()?)));
             self.session = Some(session.clone());
+            reservation.replay_volume(&*self.handler);
             // Spawn NTP timing responder for this connection.
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
@@ -315,7 +369,15 @@ impl RaopRtp {
 
             let media = self.media.clone();
             let flush_notify = self.flush_notify.clone();
+            super::diagnostics::emit(format_args!(
+                "stage=audio_transport transport=udp ipv6={} data_port_present={} control_port_present={} remote_control_port_present={}",
+                remote_sockaddr.is_ipv6(),
+                self.data_lport != 0,
+                self.control_lport != 0,
+                control_rport != 0
+            ));
             self.children.push(self.tasks.track(tokio::spawn(async move {
+                let mut probe = super::diagnostics::AudioProbe::default();
                 let mut shutdown_rx = shutdown_rx;
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
@@ -337,28 +399,33 @@ impl RaopRtp {
                         _ = flush_notify.notified() => continue,
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
-                            if let Ok((len, addr)) = result
-                                && addr.ip() == remote_sockaddr.ip() && len >= 12 {
-                                    let mut buf = buffer.lock().await;
-                                    buf.queue(&data_packet[..len], true);
-
-                                }
+                            if let Ok((len, addr)) = result {
+                                let source_matches = addr.ip() == remote_sockaddr.ip();
+                                let queued = if source_matches && len >= 12 {
+                                    Some(buffer.lock().await.queue(&data_packet[..len], true))
+                                } else { None };
+                                probe.data(&data_packet[..len], source_matches, addr.is_ipv6() == remote_sockaddr.is_ipv6(), queued);
+                            } else { probe.io_error(); }
                         }
                         // Control channel: retransmit responses (payload type 0x56).
                         result = csock.recv_from(&mut ctrl_packet) => {
-                            if let Ok((len, addr)) = result
-                                && addr.ip() == remote_sockaddr.ip() && len >= 12 {
-                                if (ctrl_packet[1] & 0x7f) == 0x54 {
-                                    let active = session.lock().unwrap_or_else(|e| e.into_inner());
-                                    if active.is_some() {
-                                        media.clock.lock().unwrap_or_else(|e| e.into_inner()).sync(&ctrl_packet[..len], format.sample_rate);
+                            if let Ok((len, addr)) = result {
+                                let source_matches = addr.ip() == remote_sockaddr.ip();
+                                let mut sync = None;
+                                if source_matches && len >= 12 {
+                                    if (ctrl_packet[1] & 0x7f) == 0x54 {
+                                        let active = session.lock().unwrap_or_else(|e| e.into_inner());
+                                        if active.is_some() {
+                                            sync = Some(media.clock.lock().unwrap_or_else(|e| e.into_inner()).sync(&ctrl_packet[..len], format.sample_rate));
+                                        }
+                                    } else if (ctrl_packet[1] & 0x7f) == CTRL_PAYLOAD_TYPE {
+                                        let mut buf = buffer.lock().await;
+                                        // Retransmit packets have a 4-byte header before the original RTP.
+                                        if len > RETRANSMIT_HEADER_LEN { buf.queue(&ctrl_packet[RETRANSMIT_HEADER_LEN..len], true); }
                                     }
-                                } else if (ctrl_packet[1] & 0x7f) == CTRL_PAYLOAD_TYPE {
-                                    let mut buf = buffer.lock().await;
-                                    // Retransmit packets have a 4-byte header before the original RTP.
-                                    if len > RETRANSMIT_HEADER_LEN { buf.queue(&ctrl_packet[RETRANSMIT_HEADER_LEN..len], true); }
                                 }
-                                }
+                                probe.control(&ctrl_packet[..len], format.sample_rate, source_matches, addr.is_ipv6() == remote_sockaddr.is_ipv6(), sync);
+                            } else { probe.io_error(); }
                         }
                     }
                     let mut buf = buffer.lock().await;
@@ -366,11 +433,16 @@ impl RaopRtp {
                         let mut active = session.lock().unwrap_or_else(|e| e.into_inner());
                         let Some(session) = active.as_mut() else { continue; };
                         if let StreamSession::Encoded(encoded) = session {
-                            if let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, audio_timing(&media, &frame, format.sample_rate)); }
+                            if let Some(payload) = frame.encoded {
+                                let timing = audio_timing(&media, &frame, format.sample_rate);
+                                probe.callback(timing.presentation_time_ns.is_some());
+                                encoded.audio_process_encoded(payload, timing);
+                            }
                             continue;
                         }
                         let samples = frame.samples;
                         let timing = audio_timing(&media, &frame, format.sample_rate);
+                        probe.callback(timing.presentation_time_ns.is_some());
                         {
                             #[cfg(feature = "resample")]
                             if let Some(ref mut rs) = resampler {
@@ -394,6 +466,7 @@ impl RaopRtp {
             let format = self.format;
             let session = Arc::new(std::sync::Mutex::new(Some(self.create_session()?)));
             self.session = Some(session.clone());
+            reservation.replay_volume(&*self.handler);
 
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
@@ -495,11 +568,27 @@ impl RaopRtp {
         for child in &self.children {
             self.media.own_transport(child.clone());
         }
+        let owner = Arc::new(AudioOwner {
+            state: AtomicU8::new(0),
+            session: self.session.as_ref().expect("started callback").clone(),
+            children: self.children.clone(),
+            shutdown: self.shutdown_tx.as_ref().expect("started shutdown").clone(),
+            media: Arc::downgrade(&self.media),
+        });
+        self.media.own_audio(&owner);
+        self.owner = Some(owner);
         Ok((self.control_lport, self.timing_lport, self.data_lport))
     }
 
     /// Request a buffer flush up to the given sequence number.
     pub(crate) fn flush(&self, next_seq: i32) {
+        let Some(active) = &self.session else {
+            return;
+        };
+        let active = active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.is_none() {
+            return;
+        }
         self.media
             .clock
             .lock()
@@ -511,13 +600,19 @@ impl RaopRtp {
 
     /// Stop the receive task and flush the buffer.
     pub(crate) fn stop(&mut self) {
+        let owner = self.owner.take();
+        if let Some(owner) = &owner {
+            owner.stop();
+        }
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
         for child in self.children.drain(..) {
             child.abort();
         }
-        if let Some(active) = self.session.take() {
+        if let Some(active) = self.session.take()
+            && owner.is_none()
+        {
             let session = active.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(mut session) = session {
                 self.media
@@ -572,5 +667,97 @@ impl StreamSession {
             Self::Pcm(session) => session.audio_flush_timed(media),
             Self::Encoded(session) => session.audio_flush_timed(media),
         }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::sync::{Mutex, atomic::AtomicUsize, mpsc};
+    struct BlockingAudio {
+        entered: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+        flushes: Arc<AtomicUsize>,
+    }
+    impl crate::raop::EncodedAudioSession for BlockingAudio {
+        fn audio_process_encoded(&mut self, _: &[u8], _: crate::raop::AudioTiming) {}
+        fn audio_flush_timed(&mut self, _: crate::raop::MediaSession) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            self.entered.send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
+    fn held_owner(
+        media: &Arc<super::super::media::MediaContext>,
+    ) -> (
+        Arc<AudioOwner>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        Arc<AtomicUsize>,
+    ) {
+        let (entered, wait) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let owner = Arc::new(AudioOwner {
+            state: AtomicU8::new(0),
+            session: Arc::new(Mutex::new(Some(StreamSession::Encoded(Box::new(
+                BlockingAudio {
+                    entered,
+                    release: Mutex::new(resume),
+                    flushes: flushes.clone(),
+                },
+            ))))),
+            children: vec![],
+            shutdown: watch::channel(false).0,
+            media: Arc::downgrade(media),
+        });
+        media.own_audio(&owner);
+        (owner, wait, release, flushes)
+    }
+    #[test]
+    fn takeover_waits_for_complete_old_flush_without_holding_context_lock() {
+        let media = Arc::new(super::super::media::MediaContext::default());
+        let other = Arc::new(super::super::media::MediaContext::default());
+        let (owner, entered, release, flushes) = held_owner(&media);
+        let worker = media.clone();
+        let thread = std::thread::spawn(move || assert!(worker.begin_audio_setup().is_some()));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            media.begin_audio_setup().is_none(),
+            "concurrent/reentrant setup must not run another factory"
+        );
+        assert!(
+            other.begin_audio_setup().is_some(),
+            "one phone's audio retirement must not block a different context"
+        );
+        assert!(
+            !owner.stop(),
+            "retirement is not complete until the callback returns"
+        );
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(media.begin_audio_setup().is_some());
+        assert!(owner.stop());
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn connection_stop_in_progress_rejects_takeover_until_its_flush_completes() {
+        let media = Arc::new(super::super::media::MediaContext::default());
+        let (owner, entered, release, flushes) = held_owner(&media);
+        let stopping = owner.clone();
+        let thread = std::thread::spawn(move || assert!(stopping.stop()));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(media.begin_audio_setup().is_none());
+        release.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(
+            media.begin_audio_setup().is_some(),
+            "rejected reservation must be released for retry"
+        );
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
     }
 }
