@@ -766,6 +766,7 @@ fn setup_stream_realtime(
             output_config,
         ));
         let abort = handle.abort_handle();
+        conn.audio_task = Some(abort.clone());
         conn.own_media(handle);
         conn.shared
             .set_active_audio(Box::new(move || abort.abort()));
@@ -830,6 +831,10 @@ fn setup_stream_realtime(
                 },
             );
             if let Some(rtp) = &mut staged_rtp {
+                // Finish the old callback/flush before a replacement factory can configure the host.
+                if let Some(mut old) = conn.raop_rtp.take() {
+                    old.stop();
+                }
                 let control_port = stream0
                     .get("controlPort")
                     .and_then(|v| v.as_unsigned_integer())
@@ -905,6 +910,7 @@ fn setup_stream_buffered(
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
     let (cmd_tx, task) = proc.start(shk_arr, output_config, handler);
+    conn.audio_task = Some(task.abort_handle());
     conn.own_media(task);
     conn.playout_cmd = Some(cmd_tx.clone());
     conn.shared.set_active_audio(Box::new(move || {
@@ -1038,14 +1044,16 @@ fn setup_stream_video(
     };
     conn.media.attach_handler(conn.shared.handler.clone());
     let session = vh.video_init_timed(conn.media.session());
-    conn.own(tokio::spawn(crate::raop::video_stream::run(
+    let task = tokio::spawn(crate::raop::video_stream::run(
         listener,
         cipher,
         session,
         conn.media.clone(),
         conn.remote_socket.ip(),
         lease,
-    )));
+    ));
+    conn.video_task = Some(task.abort_handle());
+    conn.own(task);
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
     Some(())

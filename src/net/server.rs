@@ -397,6 +397,7 @@ async fn send_completed_responses<S: AsyncWrite + Unpin>(
         let response_encrypted = handler.is_encrypted();
         config.trace_response(&response, response_encrypted);
         let disconnect = response.get_disconnect();
+        crate::raop::diagnostics::rtsp_response(&method, &url, request.data(), status, disconnect);
         let wire_out = if response_encrypted {
             handler.encrypt_outgoing(response.get_data())
         } else {
@@ -491,6 +492,7 @@ async fn process_connection<S>(
     let mut buf = [0u8; 4096];
     let mut request = PendingRequest::default();
     let mut raw_buf = Vec::new(); // accumulates encrypted data
+    let mut close_reason = "response_or_parse";
 
     loop {
         if !send_completed_responses(&mut stream, handler.as_mut(), &mut request, config).await {
@@ -501,6 +503,7 @@ async fn process_connection<S>(
                 Ok(result) if Instant::now() < deadline => result,
                 _ => {
                     tracing::debug!("Request body deadline exceeded");
+                    close_reason = "body_timeout";
                     break;
                 }
             }
@@ -508,7 +511,14 @@ async fn process_connection<S>(
             stream.read(&mut buf).await
         };
         let n = match read {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                close_reason = "peer_eof";
+                break;
+            }
+            Err(_) => {
+                close_reason = "read_io";
+                break;
+            }
             Ok(n) => n,
         };
         let accepted = if handler.is_encrypted() {
@@ -533,9 +543,11 @@ async fn process_connection<S>(
             .await
         };
         if !accepted {
+            close_reason = "invalid_input";
             break;
         }
     }
+    crate::raop::diagnostics::emit(format_args!("stage=rtsp_closed reason={close_reason}"));
     tracing::info!(%remote, "Connection closed");
 }
 

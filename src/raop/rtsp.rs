@@ -365,20 +365,75 @@ fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     }
 }
 
-/// TEARDOWN: stop RTP, stop buffered audio, close connection.
+/// Full teardown closes RTSP; audio-only teardown preserves video and its shared media identity.
+fn teardown_streams(body: Option<&[u8]>) -> Result<Option<(bool, bool)>, ()> {
+    let Some(body) = body.filter(|body| !body.is_empty()) else {
+        return Ok(None);
+    };
+    let value: plist::Value = plist::from_bytes(body).map_err(|_| ())?;
+    let dict = value.as_dictionary().ok_or(())?;
+    let Some(streams) = dict.get("streams") else {
+        return Ok(None);
+    };
+    let streams = streams
+        .as_array()
+        .filter(|streams| !streams.is_empty())
+        .ok_or(())?;
+    let mut mask = 0;
+    for stream in streams {
+        let kind = stream
+            .as_dictionary()
+            .and_then(|stream| stream.get("type"))
+            .and_then(plist::Value::as_unsigned_integer)
+            .ok_or(())?;
+        match kind {
+            96 => mask |= 1,
+            #[cfg(feature = "ap2")]
+            103 => mask |= 1,
+            #[cfg(feature = "video")]
+            110 => mask |= 2,
+            _ => return Err(()),
+        }
+    }
+    Ok(Some((mask & 1 != 0, mask & 2 != 0)))
+}
+
 fn handle_teardown(
     conn: &mut RaopConnection,
-    _request: &HttpRequest,
+    request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    response.add_header("Connection", "close");
-    response.set_disconnect(true);
-    if let Some(mut rtp) = conn.raop_rtp.take() {
-        rtp.stop();
+    let streams = match teardown_streams(request.data()) {
+        Ok(streams) => streams,
+        Err(()) => {
+            *response = new_response(400, "Bad Request", request.header("CSeq").unwrap_or("0"));
+            return None;
+        }
+    };
+    let (audio, video) = streams.unwrap_or((true, true));
+    if audio {
+        if let Some(mut rtp) = conn.raop_rtp.take() {
+            rtp.stop();
+        }
+        #[cfg(feature = "ap2")]
+        {
+            if let Some(task) = conn.audio_task.take() {
+                task.abort();
+            }
+            if let Some(cmd) = conn.playout_cmd.take() {
+                let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+            }
+        }
     }
-    #[cfg(feature = "ap2")]
-    if let Some(cmd) = &conn.playout_cmd {
-        let _ = cmd.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
+    #[cfg(feature = "video")]
+    if video && let Some(task) = conn.video_task.take() {
+        task.abort();
+    }
+    #[cfg(not(feature = "video"))]
+    let _ = video;
+    if streams.is_none() {
+        response.add_header("Connection", "close");
+        response.set_disconnect(true);
     }
     None
 }

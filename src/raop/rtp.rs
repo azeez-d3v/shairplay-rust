@@ -130,6 +130,7 @@ pub(crate) struct RaopRtp {
     media: Arc<super::media::MediaContext>,
     tasks: Arc<super::media::Tasks>,
     children: Vec<tokio::task::AbortHandle>,
+    session: Option<Arc<std::sync::Mutex<Option<StreamSession>>>>,
     handler: Arc<dyn AudioHandler>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     remote: String,
@@ -208,6 +209,7 @@ impl RaopRtp {
             media: config.media,
             tasks: config.tasks,
             children: Vec::new(),
+            session: None,
             handler: callbacks,
             remote: config.remote,
             local_addr: config.local_addr,
@@ -268,6 +270,7 @@ impl RaopRtp {
         control_rport: u16,
         timing_rport: u16,
     ) -> Result<(u16, u16, u16), ShairplayError> {
+        self.stop();
         self.control_rport = control_rport;
         info!(use_udp, control_rport, timing_rport, remote = %self.remote, "AP1 RTP starting");
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -282,7 +285,8 @@ impl RaopRtp {
             self.timing_lport = tsock.local_addr().map_err(NetworkError::Io)?.port();
             self.data_lport = dsock.local_addr().map_err(NetworkError::Io)?.port();
 
-            let mut session = self.create_session()?;
+            let session = Arc::new(std::sync::Mutex::new(Some(self.create_session()?)));
+            self.session = Some(session.clone());
             // Spawn NTP timing responder for this connection.
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
@@ -321,7 +325,9 @@ impl RaopRtp {
                         let flush = { let mut st = state.lock().unwrap_or_else(|e| e.into_inner()); let flush = st.flush; st.flush = NO_FLUSH; flush };
                         if flush != NO_FLUSH {
                             buffer.lock().await.flush(flush);
-                            session.audio_flush_timed(media.session());
+                            if let Some(session) = session.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                                session.audio_flush_timed(media.session());
+                            }
                         }
                     }
 
@@ -343,7 +349,10 @@ impl RaopRtp {
                             if let Ok((len, addr)) = result
                                 && addr.ip() == remote_sockaddr.ip() && len >= 12 {
                                 if (ctrl_packet[1] & 0x7f) == 0x54 {
-                                    media.clock.lock().unwrap_or_else(|e| e.into_inner()).sync(&ctrl_packet[..len], format.sample_rate);
+                                    let active = session.lock().unwrap_or_else(|e| e.into_inner());
+                                    if active.is_some() {
+                                        media.clock.lock().unwrap_or_else(|e| e.into_inner()).sync(&ctrl_packet[..len], format.sample_rate);
+                                    }
                                 } else if (ctrl_packet[1] & 0x7f) == CTRL_PAYLOAD_TYPE {
                                     let mut buf = buffer.lock().await;
                                     // Retransmit packets have a 4-byte header before the original RTP.
@@ -354,7 +363,9 @@ impl RaopRtp {
                     }
                     let mut buf = buffer.lock().await;
                     while let Some(frame) = buf.dequeue_timed(no_resend) {
-                        if let StreamSession::Encoded(encoded) = &mut session {
+                        let mut active = session.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(session) = active.as_mut() else { continue; };
+                        if let StreamSession::Encoded(encoded) = session {
                             if let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, audio_timing(&media, &frame, format.sample_rate)); }
                             continue;
                         }
@@ -381,7 +392,8 @@ impl RaopRtp {
             self.data_lport = listener.local_addr().map_err(NetworkError::Io)?.port();
 
             let format = self.format;
-            let mut session = self.create_session()?;
+            let session = Arc::new(std::sync::Mutex::new(Some(self.create_session()?)));
+            self.session = Some(session.clone());
 
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
@@ -419,7 +431,9 @@ impl RaopRtp {
                         let flush = { let mut st = state.lock().unwrap_or_else(|e| e.into_inner()); let flush = st.flush; st.flush = NO_FLUSH; flush };
                         if flush != NO_FLUSH {
                             buffer.lock().await.flush(flush);
-                            session.audio_flush_timed(media.session());
+                            if let Some(session) = session.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                                session.audio_flush_timed(media.session());
+                            }
                         }
                     }
 
@@ -451,9 +465,11 @@ impl RaopRtp {
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
                                 if let Some(frame) = buf.dequeue_timed(true) {
+                                    let mut active = session.lock().unwrap_or_else(|e| e.into_inner());
+                                    let Some(session) = active.as_mut() else { break 'tcp; };
                                     let samples = frame.samples;
                                     let timing = audio_timing(&media, &frame, format.sample_rate);
-                                    if let StreamSession::Encoded(encoded) = &mut session && let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, timing); }
+                                    if let StreamSession::Encoded(encoded) = session && let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, timing); }
                                     {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
@@ -500,6 +516,17 @@ impl RaopRtp {
         }
         for child in self.children.drain(..) {
             child.abort();
+        }
+        if let Some(active) = self.session.take() {
+            let session = active.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(mut session) = session {
+                self.media
+                    .clock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .reset();
+                session.audio_flush_timed(self.media.session());
+            }
         }
     }
 }

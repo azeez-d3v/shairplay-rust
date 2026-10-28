@@ -46,14 +46,43 @@ fn classify_packet(packet_type: u16, payload: &[u8]) -> PacketKind {
     }
 }
 
-async fn read_with_timeout(stream: &mut TcpStream, buffer: &mut [u8], part: &str) -> bool {
+struct VideoExit {
+    reason: &'static str,
+    part: &'static str,
+    packets: u64,
+    frames: u64,
+}
+impl Drop for VideoExit {
+    fn drop(&mut self) {
+        super::diagnostics::emit(format_args!(
+            "stage=video_exit reason={} part={} packets={} frames={}",
+            self.reason, self.part, self.packets, self.frames
+        ));
+    }
+}
+
+async fn read_with_timeout(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    part: &'static str,
+    exit: &mut VideoExit,
+) -> bool {
     match tokio::time::timeout(READ_TIMEOUT, stream.read_exact(buffer)).await {
         Ok(Ok(_)) => true,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
+            exit.part = part;
+            exit.reason = match error.kind() {
+                std::io::ErrorKind::UnexpectedEof => "peer_eof",
+                std::io::ErrorKind::ConnectionReset => "peer_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                _ => "read_io",
+            };
             debug!(part, "Video stream ended during read");
             false
         }
         Err(_) => {
+            exit.part = part;
+            exit.reason = "read_timeout";
             debug!(part, "Video stream read timed out");
             false
         }
@@ -70,7 +99,14 @@ pub(crate) async fn run(
     lease: super::media::VideoLease,
 ) {
     // Inner future owns every socket; normal completion drops them before retiring the lease.
-    run_transport(listener, cipher, session, media, remote).await;
+    let mut exit = VideoExit {
+        reason: "task_cancelled",
+        part: "accept",
+        packets: 0,
+        frames: 0,
+    };
+    run_transport(listener, cipher, session, media, remote, &mut exit).await;
+    drop(exit);
     drop(lease);
 }
 
@@ -80,19 +116,23 @@ async fn run_transport(
     session: Box<dyn VideoSession>,
     media: std::sync::Arc<super::media::MediaContext>,
     remote: std::net::IpAddr,
+    exit: &mut VideoExit,
 ) {
     let (stream, addr) = match listener.accept().await {
         Ok(s) => s,
         Err(e) => {
+            exit.reason = "accept_io";
             warn!("Video stream accept failed: {e}");
             return;
         }
     };
     if addr.ip() != remote {
+        exit.reason = "peer_mismatch";
         return;
     }
     info!(%addr, "Video stream client connected");
-    process(stream, cipher, session, media).await;
+    exit.part = "header";
+    process(stream, cipher, session, media, exit).await;
 }
 
 async fn process(
@@ -100,12 +140,13 @@ async fn process(
     mut cipher: VideoCipher,
     mut session: Box<dyn VideoSession>,
     media: std::sync::Arc<super::media::MediaContext>,
+    exit: &mut VideoExit,
 ) {
     let stream_session = media.session();
     let mut header = [0u8; VIDEO_HEADER_LEN];
 
     loop {
-        if !read_with_timeout(&mut stream, &mut header, "header").await {
+        if !read_with_timeout(&mut stream, &mut header, "header", exit).await {
             break;
         }
         let metadata = parse_header(&header);
@@ -113,6 +154,8 @@ async fn process(
             continue;
         }
         if metadata.payload_len > MAX_VIDEO_PAYLOAD_LEN {
+            exit.reason = "oversized_payload";
+            exit.part = "header";
             warn!(
                 payload_len = metadata.payload_len,
                 "Video payload exceeds maximum allowed size"
@@ -121,7 +164,7 @@ async fn process(
         }
 
         let mut payload = BytesMut::zeroed(metadata.payload_len);
-        if !read_with_timeout(&mut stream, &mut payload, "payload").await {
+        if !read_with_timeout(&mut stream, &mut payload, "payload", exit).await {
             break;
         }
         let kind = classify_packet(metadata.packet_type, &payload);
@@ -135,6 +178,23 @@ async fn process(
             payload_len = metadata.payload_len,
             "Video packet"
         );
+        if exit.packets == 0 {
+            let kind = match kind {
+                PacketKind::AvcC => "avcc",
+                PacketKind::HvcC => "hvcc",
+                PacketKind::Payload => "frame",
+                PacketKind::Plist => "plist",
+                PacketKind::Other(_) => "other",
+            };
+            super::diagnostics::emit(format_args!("stage=video_first_packet kind={kind}"));
+        }
+        if matches!(kind, PacketKind::Payload) {
+            if exit.frames == 0 {
+                super::diagnostics::emit(format_args!("stage=video_first_frame"));
+            }
+            exit.frames = exit.frames.saturating_add(1);
+        }
+        exit.packets = exit.packets.saturating_add(1);
         session.on_video_timed(
             VideoPacket {
                 kind,

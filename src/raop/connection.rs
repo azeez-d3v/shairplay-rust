@@ -88,6 +88,10 @@ pub(crate) fn new_raop_connection(
     handlers::RaopConnection {
         media: Arc::new(super::media::MediaContext::default()),
         children: Vec::new(),
+        #[cfg(feature = "ap2")]
+        audio_task: None,
+        #[cfg(feature = "video")]
+        video_task: None,
         raop_rtp: None,
         fairplay: FairPlay::new(),
         pairing: shared.pairing.create_session(),

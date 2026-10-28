@@ -67,17 +67,18 @@ impl MediaContext {
         {
             transport.abort();
         }
-        self.notify_ended();
+        self.notify_ended("video_lease");
         // A replacement's factory must not run before the host finishes resetting the old session.
         self.video_state.store(RETIRED, Ordering::Release);
     }
-    fn notify_ended(&self) {
+    fn notify_ended(&self, source: &'static str) {
         let handler = self
             .handler
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(handler) = handler {
+            super::diagnostics::emit(format_args!("stage=media_end source={source}"));
             handler.on_media_session_ended(self.session());
         }
     }
@@ -169,7 +170,7 @@ impl Drop for VideoLease {
 }
 impl Drop for MediaContext {
     fn drop(&mut self) {
-        self.notify_ended();
+        self.notify_ended("last_owner");
     }
 }
 #[cfg(test)]

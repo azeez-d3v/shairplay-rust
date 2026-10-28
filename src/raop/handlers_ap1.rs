@@ -16,6 +16,10 @@ use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 pub(crate) struct RaopConnection {
     pub(crate) media: Arc<super::media::MediaContext>,
     pub(crate) children: Vec<tokio::task::AbortHandle>,
+    #[cfg(feature = "ap2")]
+    pub(crate) audio_task: Option<tokio::task::AbortHandle>,
+    #[cfg(feature = "video")]
+    pub(crate) video_task: Option<tokio::task::AbortHandle>,
     pub(crate) raop_rtp: Option<RaopRtp>,
     pub(crate) fairplay: FairPlay,
     pub(crate) pairing: PairingSession,

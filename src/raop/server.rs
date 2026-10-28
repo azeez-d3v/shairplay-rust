@@ -476,6 +476,7 @@ impl RaopServer {
 
     /// Stop the server: unregister mDNS services and close all listeners.
     pub async fn stop(&mut self) {
+        super::diagnostics::emit(format_args!("stage=receiver_stop source=host_request"));
         if let Some(mut mdns) = self.mdns.take() {
             mdns.unregister_raop();
             mdns.unregister_airplay();
@@ -1167,3 +1168,7 @@ mod native_protocol_tests {
         assert!(verified.admit_media());
     }
 }
+
+#[cfg(all(test, feature = "video"))]
+#[path = "teardown_tests.rs"]
+mod teardown_tests;
