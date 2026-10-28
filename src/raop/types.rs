@@ -2,6 +2,66 @@
 
 use std::sync::Arc;
 
+/// Receiver-owned media identity and discontinuity generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MediaSession {
+    /// Opaque identity, not a network address.
+    pub id: u64,
+    /// Changes when a common audio/video timeline is invalidated.
+    pub generation: u64,
+}
+
+/// Original audio timing, independent of output resampling.
+#[derive(Debug, Clone, Copy)]
+pub struct AudioTiming {
+    /// Media identity and generation.
+    pub session: MediaSession,
+    /// Wrapping RTP sequence.
+    pub sequence: u16,
+    /// Wrapping RTP sample-clock timestamp.
+    pub rtp_timestamp: u32,
+    /// Original samples per channel.
+    pub sample_count: u32,
+    /// Original sample rate in Hz.
+    pub source_sample_rate: u32,
+    /// Sender NTP era-local nanoseconds; absent until anchored (not Unix time).
+    pub presentation_time_ns: Option<u64>,
+    /// True for loss-concealment silence.
+    pub concealed: bool,
+}
+
+/// Negotiated source wire codec (distinct from decoded PCM output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireAudioCodec {
+    /// Apple Lossless.
+    Alac,
+    /// Network-order PCM.
+    Pcm,
+    /// MPEG-4 AAC Enhanced Low Delay, not AAC-LC or ADTS.
+    AacEld,
+}
+/// Decrypted encoded-audio format for an application-owned decoder.
+#[derive(Debug, Clone)]
+pub struct EncodedAudioFormat {
+    /// Negotiated wire codec.
+    pub codec: WireAudioCodec,
+    /// Source rate in Hz.
+    pub sample_rate: u32,
+    /// Interleaved channel count.
+    pub channels: u8,
+    /// Samples per packet per channel.
+    pub samples_per_frame: u32,
+    /// Decoder-specific configuration (AudioSpecificConfig for AAC).
+    pub codec_config: Vec<u8>,
+}
+/// Encoded packets retaining the original RTP timing.
+pub trait EncodedAudioSession: Send + Sync {
+    /// Receive one decrypted codec packet, without an RTP or ADTS header.
+    fn audio_process_encoded(&mut self, packet: &[u8], timing: AudioTiming);
+    /// Invalidate the old generation.
+    fn audio_flush_timed(&mut self, _session: MediaSession) {}
+}
+
 /// Runtime protocol mode selection.
 ///
 /// When the `ap2` feature is enabled, this controls whether the server
@@ -102,6 +162,24 @@ pub trait AudioHandler: Send + Sync + 'static {
     /// Called when a new audio stream starts. Return a session to receive PCM data.
     fn audio_init(&self, format: AudioFormat) -> Box<dyn AudioSession>;
 
+    /// Start an audio stream with a receiver-owned media identity.
+    fn audio_init_timed(
+        &self,
+        format: AudioFormat,
+        _session: MediaSession,
+    ) -> Box<dyn AudioSession> {
+        self.audio_init(format)
+    }
+
+    /// Opt into a negotiated encoded codec. None rejects the unsupported stream explicitly.
+    fn audio_init_encoded(
+        &self,
+        _format: EncodedAudioFormat,
+        _session: MediaSession,
+    ) -> Option<Box<dyn EncodedAudioSession>> {
+        None
+    }
+
     // --- Metadata events (called from RTSP thread, never blocks audio) ---
 
     /// Volume change in dB (0.0 = max, -144.0 = mute).
@@ -116,6 +194,12 @@ pub trait AudioHandler: Send + Sync + 'static {
     fn on_remote_control(&self, _remote: Arc<dyn RemoteControl>) {}
 
     // --- Connection lifecycle ---
+
+    /// Reports the negotiated source wire codec (decoded output may still be PCM).
+    fn on_audio_codec(&self, _session: MediaSession, _codec: WireAudioCodec) {}
+
+    /// Called once when the last owner of a media session ends, not on auxiliary disconnect.
+    fn on_media_session_ended(&self, _session: MediaSession) {}
 
     /// Called when a client connects.
     fn on_client_connected(&self, _addr: &str) {}
@@ -212,6 +296,14 @@ impl PairingStore for MemoryPairingStore {
 pub trait AudioSession: Send + Sync {
     /// Receive decoded f32 interleaved PCM audio samples.
     fn audio_process(&mut self, samples: &[f32]);
+    /// Receive audio with its original source timing.
+    fn audio_process_timed(&mut self, samples: &[f32], _timing: AudioTiming) {
+        self.audio_process(samples);
+    }
+    /// Invalidate the previous generation and flush pending audio.
+    fn audio_flush_timed(&mut self, _session: MediaSession) {
+        self.audio_flush();
+    }
     /// Flush the audio buffer (e.g. on seek).
     fn audio_flush(&mut self) {}
 }

@@ -14,6 +14,8 @@ use crate::crypto::pairing_homekit::{PairVerifyServer, SrpServer};
 
 /// Per-connection state for RTSP handler dispatch. Equivalent to raop_conn_t.
 pub(crate) struct RaopConnection {
+    pub(crate) media: Arc<super::media::MediaContext>,
+    pub(crate) children: Vec<tokio::task::AbortHandle>,
     pub(crate) raop_rtp: Option<RaopRtp>,
     pub(crate) fairplay: FairPlay,
     pub(crate) pairing: PairingSession,
@@ -28,6 +30,10 @@ pub(crate) struct RaopConnection {
     // AirPlay 2 state
     #[cfg(feature = "ap2")]
     pub(crate) srp_server: Option<SrpServer>,
+    #[cfg(feature = "ap2")]
+    pub(crate) pin_setup: Option<crate::crypto::pairing_pin::PinSetup>,
+    #[cfg(feature = "ap2")]
+    pub(crate) authenticated_peer: Option<[u8; 32]>,
     #[cfg(feature = "ap2")]
     pub(crate) pair_verify: Option<PairVerifyServer>,
     #[cfg(feature = "ap2")]
@@ -112,6 +118,17 @@ pub(crate) fn handle_pair_verify(
             }
             let ecdh_key: &[u8; 32] = data[4..36].try_into().ok()?;
             let ed_key: &[u8; 32] = data[36..68].try_into().ok()?;
+            #[cfg(feature = "ap2")]
+            if conn.shared.pin.is_some()
+                && conn.shared.pairing_store.get(&legacy_pairing_id(ed_key)) != Some(*ed_key)
+            {
+                *response = super::rtsp::new_response(
+                    470,
+                    "Client Authentication Failure",
+                    request.header("CSeq").unwrap_or("0"),
+                );
+                return None;
+            }
             let _ = conn.pairing.handshake(ecdh_key, ed_key);
             let public_key = conn.pairing.get_public_key().ok()?;
             let signature = conn.pairing.get_signature().ok()?;
@@ -130,11 +147,23 @@ pub(crate) fn handle_pair_verify(
                 tracing::warn!("AP1 pair-verify finish failed: {e}");
                 conn.shared.handler.on_error(&ShairplayError::Crypto(e));
                 response.set_disconnect(true);
+            } else {
+                #[cfg(feature = "ap2")]
+                if let Some(peer) = conn.pairing.verified_peer()
+                    && conn.shared.pairing_store.get(&legacy_pairing_id(&peer)) == Some(peer)
+                {
+                    conn.authenticated_peer = Some(peer);
+                }
             }
             None
         }
         _ => None,
     }
+}
+
+#[cfg(feature = "ap2")]
+pub(crate) fn legacy_pairing_id(peer: &[u8; 32]) -> String {
+    format!("legacy:{}", hex::encode(peer))
 }
 
 /// FairPlay DRM handshake (fp-setup M1/M2).
@@ -199,6 +228,12 @@ pub(crate) fn handle_announce(
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
+    #[cfg(feature = "ap2")]
+    if !conn.admit_media() {
+        *response =
+            super::rtsp::new_response(403, "Forbidden", request.header("CSeq").unwrap_or("0"));
+        return None;
+    }
     let data = request.data()?;
     let sdp_str = std::str::from_utf8(data).ok()?;
     let sdp = Sdp::parse(sdp_str);
@@ -302,6 +337,9 @@ pub(crate) fn handle_announce(
     conn.raop_rtp = RaopRtp::new(
         conn.shared.handler.clone(),
         crate::raop::rtp::RtpConfig {
+            encoded_format: None,
+            media: conn.media.clone(),
+            tasks: conn.shared.tasks.clone(),
             remote: remote.to_string(),
             local_addr: local_ip_from(conn),
             rtpmap: rtpmap.to_string(),
@@ -335,6 +373,12 @@ pub(crate) fn handle_setup(
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
+    #[cfg(feature = "ap2")]
+    if !conn.admit_media() {
+        *response =
+            super::rtsp::new_response(403, "Forbidden", request.header("CSeq").unwrap_or("0"));
+        return None;
+    }
     let transport = request.header("Transport")?;
     tracing::debug!(transport, "AP1 SETUP");
 
@@ -496,6 +540,8 @@ mod tests {
 
     fn test_connection(handler: Arc<RecordingHandler>) -> RaopConnection {
         let shared = Arc::new(RaopShared {
+            tasks: Arc::new(super::super::media::Tasks::default()),
+            media: std::sync::Mutex::default(),
             rsakey: Arc::new(RsaKey::from_pem(include_str!("../../airport.key")).unwrap()),
             pairing: Arc::new(Pairing::generate().unwrap()),
             hwaddr: vec![0u8; 6],
@@ -508,6 +554,8 @@ mod tests {
         });
         let pairing = shared.pairing.create_session();
         RaopConnection {
+            media: Arc::new(super::super::media::MediaContext::default()),
+            children: Vec::new(),
             raop_rtp: None,
             fairplay: FairPlay::new(),
             pairing,
@@ -582,5 +630,66 @@ mod tests {
             handler.errors.lock().unwrap().is_empty(),
             "no error expected on success"
         );
+    }
+}
+
+impl Drop for RaopConnection {
+    fn drop(&mut self) {
+        for child in &self.children {
+            child.abort();
+        }
+    }
+}
+impl RaopConnection {
+    #[cfg(feature = "ap2")]
+    pub(crate) fn admit_media(&mut self) -> bool {
+        let trusted = self
+            .authenticated_peer
+            .or_else(|| self.pair_verify.as_ref().and_then(|pv| pv.verified_peer()));
+        let peer = trusted.or_else(|| {
+            self.shared
+                .pin
+                .is_none()
+                .then(|| self.pairing.verified_peer())
+                .flatten()
+        });
+        if let Some(peer) = peer {
+            let media = self
+                .shared
+                .media
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .acquire(peer);
+            if let Some(media) = media {
+                self.media = media;
+                return true;
+            }
+            self.shared.handler.on_error(&ShairplayError::Protocol(
+                crate::error::ProtocolError::InvalidRtsp(
+                    "another authenticated phone owns media".into(),
+                ),
+            ));
+            return false;
+        }
+        if self.shared.pin.is_some() {
+            self.shared.handler.on_error(&ShairplayError::Protocol(
+                crate::error::ProtocolError::InvalidRtsp(
+                    "PIN-protected media requires an authenticated pairing identity".into(),
+                ),
+            ));
+            return false;
+        }
+        true
+    }
+
+    #[cfg(feature = "ap2")]
+    pub(crate) fn own(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.children.push(self.shared.tasks.track(task));
+    }
+    #[cfg(feature = "ap2")]
+    pub(crate) fn own_media(&mut self, task: tokio::task::JoinHandle<()>) {
+        let abort = self.shared.tasks.track(task);
+        self.media.own_transport(abort.clone());
+        self.children.push(abort);
     }
 }

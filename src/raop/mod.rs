@@ -98,3 +98,4 @@ impl RemoteControl for DacpRemoteControl {
         ]
     }
 }
+pub(crate) mod media;

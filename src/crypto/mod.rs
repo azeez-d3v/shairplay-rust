@@ -17,3 +17,6 @@ pub mod tlv;
 pub mod video_cipher;
 #[cfg(feature = "video")]
 pub mod video_key;
+
+#[cfg(feature = "ap2")]
+pub(crate) mod pairing_pin;

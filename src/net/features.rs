@@ -163,7 +163,6 @@ pub(crate) fn receiver_features_for_pairing(requires_pin_pairing: bool) -> u64 {
     // No AP2 bits (40, 41, 46, 48) — pure legacy protocol for video.
     #[cfg(feature = "video")]
     {
-        let _ = requires_pin_pairing;
         use AirPlayFeature::*;
         let mut val = features_from(&[
             SupportsAirPlayPhoto,              // bit 1
@@ -188,6 +187,9 @@ pub(crate) fn receiver_features_for_pairing(requires_pin_pairing: bool) -> u64 {
         // empirically for legacy screen-mirroring compat. Kept as raw shifts
         // deliberately; the exact value is pinned by `video_receiver_uses_uxplay_features`.
         val |= (1 << 10) | (1 << 12) | (1 << 13) | (1 << 25) | (1 << 28);
+        if requires_pin_pairing {
+            val |= 1 << (SupportsLegacyPairing as u8);
+        }
         val
     }
 

@@ -77,7 +77,10 @@ impl BufferedAudioProcessor {
         shk: [u8; 32],
         output_config: OutputConfig,
         handler: Arc<dyn AudioHandler>,
-    ) -> tokio::sync::mpsc::UnboundedSender<PlayoutCommand> {
+    ) -> (
+        tokio::sync::mpsc::UnboundedSender<PlayoutCommand>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let default_sr = output_config.sample_rate.unwrap_or(44100);
 
@@ -99,14 +102,14 @@ impl BufferedAudioProcessor {
         let state2 = state.clone();
         let handler2 = handler.clone();
         let output_config2 = output_config.clone();
-        std::thread::spawn(move || {
+        let delivery = std::thread::spawn(move || {
             delivery_loop(state2, handler2, output_config2);
         });
 
         // Command handler
         let state3 = state.clone();
         let mut cmd_rx = cmd_rx;
-        tokio::spawn(async move {
+        let commands = async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 let (lock, cvar) = &*state3;
                 let mut s = lock.lock().unwrap();
@@ -170,12 +173,12 @@ impl BufferedAudioProcessor {
                     }
                 }
             }
-        });
+        };
 
         // Receiver task
         let state4 = state.clone();
 
-        tokio::spawn(async move {
+        let receiver = async move {
             let (stream, addr) = match self.listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -186,9 +189,36 @@ impl BufferedAudioProcessor {
             };
             info!(%addr, "Buffered audio client connected");
             receive_loop(stream, &shk, output_config, state4, &handler).await;
-        });
+        };
 
-        cmd_tx
+        let owner = BufferedOwner {
+            state,
+            delivery: Some(delivery),
+        };
+        let task = tokio::spawn(async move {
+            let _owner = owner;
+            tokio::select! { _ = commands => {}, _ = receiver => {} }
+        });
+        (cmd_tx, task)
+    }
+}
+
+struct BufferedOwner {
+    state: Arc<(Mutex<PlayoutState>, Condvar)>,
+    delivery: Option<std::thread::JoinHandle<()>>,
+}
+impl Drop for BufferedOwner {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.state;
+        {
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+            state.stopped = true;
+            state.buffer.clear();
+            cvar.notify_all();
+        }
+        if let Some(thread) = self.delivery.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -375,4 +405,35 @@ fn delivery_loop(
         }
     }
     info!("Delivery loop ended");
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    struct Handler;
+    struct Session;
+    impl AudioHandler for Handler {
+        fn audio_init(&self, _: crate::raop::AudioFormat) -> Box<dyn crate::raop::AudioSession> {
+            Box::new(Session)
+        }
+    }
+    impl crate::raop::AudioSession for Session {
+        fn audio_process(&mut self, _: &[f32]) {}
+    }
+    #[tokio::test]
+    async fn abort_releases_buffered_listener_and_delivery_thread() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_cmd, task) = BufferedAudioProcessor { listener }.start(
+            [0; 32],
+            OutputConfig {
+                sample_rate: None,
+                max_channels: None,
+            },
+            Arc::new(Handler),
+        );
+        task.abort();
+        let _ = task.await;
+        assert!(TcpListener::bind(addr).await.is_ok());
+    }
 }

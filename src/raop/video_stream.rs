@@ -65,6 +65,21 @@ pub(crate) async fn run(
     listener: TcpListener,
     cipher: VideoCipher,
     session: Box<dyn VideoSession>,
+    media: std::sync::Arc<super::media::MediaContext>,
+    remote: std::net::IpAddr,
+    lease: super::media::VideoLease,
+) {
+    // Inner future owns every socket; normal completion drops them before retiring the lease.
+    run_transport(listener, cipher, session, media, remote).await;
+    drop(lease);
+}
+
+async fn run_transport(
+    listener: TcpListener,
+    cipher: VideoCipher,
+    session: Box<dyn VideoSession>,
+    media: std::sync::Arc<super::media::MediaContext>,
+    remote: std::net::IpAddr,
 ) {
     let (stream, addr) = match listener.accept().await {
         Ok(s) => s,
@@ -73,15 +88,20 @@ pub(crate) async fn run(
             return;
         }
     };
+    if addr.ip() != remote {
+        return;
+    }
     info!(%addr, "Video stream client connected");
-    process(stream, cipher, session).await;
+    process(stream, cipher, session, media).await;
 }
 
 async fn process(
     mut stream: TcpStream,
     mut cipher: VideoCipher,
     mut session: Box<dyn VideoSession>,
+    media: std::sync::Arc<super::media::MediaContext>,
 ) {
+    let stream_session = media.session();
     let mut header = [0u8; VIDEO_HEADER_LEN];
 
     loop {
@@ -115,11 +135,17 @@ async fn process(
             payload_len = metadata.payload_len,
             "Video packet"
         );
-        session.on_video(VideoPacket {
-            kind,
-            timestamp: metadata.timestamp,
-            payload: payload.freeze(),
-        });
+        session.on_video_timed(
+            VideoPacket {
+                kind,
+                timestamp: metadata.timestamp,
+                payload: payload.freeze(),
+            },
+            super::video::VideoTiming {
+                session: stream_session,
+                presentation_time_ns: super::ntp::video_time(metadata.timestamp),
+            },
+        );
     }
     session.on_video_end();
 }

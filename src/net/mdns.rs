@@ -155,8 +155,13 @@ impl AirPlayServiceInfo {
         let features_lo = features & 0xFFFFFFFF;
         let features_hi = (features >> 32) & 0xFFFFFFFF;
         let ft = format!("0x{features_lo:X},0x{features_hi:X}");
-        let status_flags =
-            crate::raop::config::ap2_status_flags(requires_pin_pairing, already_paired);
+        let legacy_pin = cfg!(feature = "video") && requires_pin_pairing;
+        let status_flags = if legacy_pin {
+            0x8c
+        } else {
+            crate::raop::config::ap2_status_flags(requires_pin_pairing, already_paired)
+        };
+        let airplay_flags = if legacy_pin { 4 } else { status_flags };
 
         let raop_txt = vec![
             // AP1 compatibility fields (allows classic AirPlay fallback)
@@ -165,7 +170,12 @@ impl AirPlayServiceInfo {
             ("et".into(), RAOP_AP2_ET.into()),
             (
                 "pw".into(),
-                (if password { "true" } else { "false" }).into(),
+                (if password || legacy_pin {
+                    "true"
+                } else {
+                    "false"
+                })
+                .into(),
             ),
             // AP2 fields
             ("ft".into(), ft.clone()),
@@ -181,11 +191,20 @@ impl AirPlayServiceInfo {
         ];
 
         let airplay_txt = vec![
+            (
+                "pw".into(),
+                (if password || legacy_pin {
+                    "true"
+                } else {
+                    "false"
+                })
+                .into(),
+            ),
             ("acl".into(), "0".into()),
             ("btaddr".into(), "00:00:00:00:00:00".into()),
             ("deviceid".into(), hw_airplay),
             ("features".into(), ft),
-            ("flags".into(), format!("0x{status_flags:X}")),
+            ("flags".into(), format!("0x{airplay_flags:X}")),
             ("gid".into(), pi.into()),
             ("igl".into(), "0".into()),
             ("gcgl".into(), "0".into()),
@@ -515,9 +534,11 @@ mod tests {
                 .map(|(_, v)| v.as_str())
         };
 
-        assert_eq!(raop("ft"), Some("0x527FFEE6,0x0"));
-        assert_eq!(airplay("features"), Some("0x527FFEE6,0x0"));
-        assert_eq!(raop("sf"), Some("0x204"));
-        assert_eq!(airplay("flags"), Some("0x204"));
+        assert_eq!(raop("ft"), Some("0x5A7FFEE6,0x0"));
+        assert_eq!(airplay("features"), Some("0x5A7FFEE6,0x0"));
+        assert_eq!(raop("sf"), Some("0x8C"));
+        assert_eq!(raop("pw"), Some("true"));
+        assert_eq!(airplay("pw"), Some("true"));
+        assert_eq!(airplay("flags"), Some("0x4"));
     }
 }

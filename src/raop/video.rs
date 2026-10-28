@@ -6,6 +6,15 @@
 
 use bytes::Bytes;
 
+/// Video timing in the same sender clock domain as audio.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoTiming {
+    /// Receiver-owned media identity and generation.
+    pub session: super::MediaSession,
+    /// Sender NTP era-local nanoseconds (not Unix time).
+    pub presentation_time_ns: Option<u64>,
+}
+
 /// Classification of a video packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketKind {
@@ -36,6 +45,10 @@ pub struct VideoPacket {
 pub trait VideoHandler: Send + Sync + 'static {
     /// Called when a new video stream is established.
     fn video_init(&self) -> Box<dyn VideoSession>;
+    /// Start a video stream sharing an audio media identity.
+    fn video_init_timed(&self, _session: super::MediaSession) -> Box<dyn VideoSession> {
+        self.video_init()
+    }
 }
 
 /// Per-stream video session receiving decrypted video packets.
@@ -44,6 +57,11 @@ pub trait VideoHandler: Send + Sync + 'static {
 pub trait VideoSession: Send + Sync {
     /// Called for each decrypted video packet.
     fn on_video(&mut self, packet: VideoPacket);
+
+    /// Receive a packet with normalized sender presentation time.
+    fn on_video_timed(&mut self, packet: VideoPacket, _timing: VideoTiming) {
+        self.on_video(packet);
+    }
 
     /// Called when the video stream ends (client disconnected or error).
     fn on_video_end(&mut self) {}

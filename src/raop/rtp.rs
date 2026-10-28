@@ -90,6 +90,9 @@ struct RtpState {
 
 /// Configuration for creating an AP1 RTP session, parsed from SDP.
 pub(crate) struct RtpConfig {
+    pub(crate) encoded_format: Option<super::EncodedAudioFormat>,
+    pub(crate) media: Arc<super::media::MediaContext>,
+    pub(crate) tasks: Arc<super::media::Tasks>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     pub(crate) remote: String,
     /// Local IP address to bind sockets to.
@@ -121,6 +124,12 @@ pub(crate) struct RtpEncryption {
 /// Dropped when the RTSP connection closes, which sends a shutdown signal
 /// to the receive task via the [`watch`] channel.
 pub(crate) struct RaopRtp {
+    encoded_format: Option<super::EncodedAudioFormat>,
+    wire_codec: super::WireAudioCodec,
+    flush_notify: Arc<tokio::sync::Notify>,
+    media: Arc<super::media::MediaContext>,
+    tasks: Arc<super::media::Tasks>,
+    children: Vec<tokio::task::AbortHandle>,
     handler: Arc<dyn AudioHandler>,
     /// SDP `c=` remote address string (e.g. "192.168.1.5").
     remote: String,
@@ -133,7 +142,7 @@ pub(crate) struct RaopRtp {
     /// Shared packet buffer (decrypt + decode on queue, dequeue in order).
     buffer: Arc<Mutex<RaopBuffer>>,
     /// Shared mutable state for cross-task event delivery.
-    state: Arc<Mutex<RtpState>>,
+    state: Arc<std::sync::Mutex<RtpState>>,
     /// Send `true` to shut down the receive task.
     shutdown_tx: Option<watch::Sender<bool>>,
     /// iPhone's control port (0 = no retransmits).
@@ -172,14 +181,33 @@ impl RaopRtp {
     /// Returns `None` if the peer-supplied codec configuration is unsupported or malformed.
     pub(crate) fn new(callbacks: Arc<dyn AudioHandler>, config: RtpConfig) -> Option<Self> {
         let fmtp = config.fmtp.as_deref().unwrap_or_default();
-        let buffer = match config.encryption {
-            Some(encryption) => {
-                RaopBuffer::new(&config.rtpmap, fmtp, &encryption.key, &encryption.iv)
+        let buffer = if let Some(format) = &config.encoded_format {
+            RaopBuffer::new_encoded(format.clone(), config.encryption.map(|e| (e.key, e.iv)))
+        } else {
+            match config.encryption {
+                Some(encryption) => {
+                    RaopBuffer::new(&config.rtpmap, fmtp, &encryption.key, &encryption.iv)
+                }
+                None => RaopBuffer::new_unencrypted(&config.rtpmap, fmtp),
             }
-            None => RaopBuffer::new_unencrypted(&config.rtpmap, fmtp),
         }?;
         let format = buffer.format();
         Some(Self {
+            wire_codec: config.encoded_format.as_ref().map_or_else(
+                || {
+                    if config.rtpmap.to_ascii_lowercase().contains("applelossless") {
+                        super::WireAudioCodec::Alac
+                    } else {
+                        super::WireAudioCodec::Pcm
+                    }
+                },
+                |format| format.codec,
+            ),
+            encoded_format: config.encoded_format,
+            flush_notify: Arc::new(tokio::sync::Notify::new()),
+            media: config.media,
+            tasks: config.tasks,
+            children: Vec::new(),
             handler: callbacks,
             remote: config.remote,
             local_addr: config.local_addr,
@@ -187,13 +215,40 @@ impl RaopRtp {
             remote_socket: config.remote_socket,
             format,
             buffer: Arc::new(Mutex::new(buffer)),
-            state: Arc::new(Mutex::new(RtpState { flush: NO_FLUSH })),
+            state: Arc::new(std::sync::Mutex::new(RtpState { flush: NO_FLUSH })),
             shutdown_tx: None,
             control_rport: 0,
             control_lport: 0,
             timing_lport: 0,
             data_lport: 0,
         })
+    }
+
+    fn create_session(&self) -> Result<StreamSession, ShairplayError> {
+        self.media.attach_handler(self.handler.clone());
+        self.handler
+            .on_audio_codec(self.media.session(), self.wire_codec);
+        if let Some(format) = &self.encoded_format {
+            return self
+                .handler
+                .audio_init_encoded(format.clone(), self.media.session())
+                .map(StreamSession::Encoded)
+                .ok_or_else(|| {
+                    crate::error::CodecError::UnsupportedFormat(
+                        "application has no decoder for negotiated encoded audio".into(),
+                    )
+                    .into()
+                });
+        }
+        Ok(StreamSession::Pcm(self.handler.audio_init_timed(
+            AudioFormat {
+                codec: AudioCodec::Pcm,
+                bits: 32,
+                channels: self.format.num_channels,
+                sample_rate: self.output_sample_rate.unwrap_or(self.format.sample_rate),
+            },
+            self.media.session(),
+        )))
     }
 
     /// Bind UDP/TCP sockets and spawn the async receive task.
@@ -227,22 +282,19 @@ impl RaopRtp {
             self.timing_lport = tsock.local_addr().map_err(NetworkError::Io)?.port();
             self.data_lport = dsock.local_addr().map_err(NetworkError::Io)?.port();
 
+            let mut session = self.create_session()?;
             // Spawn NTP timing responder for this connection.
             let remote_sockaddr = self.remote_socket;
             let mut timing_addr = remote_sockaddr;
             timing_addr.set_port(timing_rport);
-            super::ntp::spawn_ntp_responder(tsock, timing_addr);
+            self.children
+                .push(self.tasks.track(super::ntp::spawn_ntp_responder(
+                    tsock,
+                    timing_addr,
+                    self.media.clone(),
+                )));
 
             let format = self.format;
-            let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: format.num_channels,
-                // When resampling is enabled the audio delivered downstream is at
-                // the output rate, so announce that (matching the non-UDP path);
-                // fall back to the stream's native rate when not resampling.
-                sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
-            });
 
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
@@ -257,69 +309,79 @@ impl RaopRtp {
             let no_resend = control_rport == 0;
             let _remote_for_task = self.remote.clone();
 
-            tokio::spawn(async move {
+            let media = self.media.clone();
+            let flush_notify = self.flush_notify.clone();
+            self.children.push(self.tasks.track(tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_rx;
                 let mut data_packet = [0u8; RAOP_PACKET_LEN];
                 let mut ctrl_packet = [0u8; RAOP_PACKET_LEN];
                 loop {
                     // Drain flush events only — metadata goes through AudioHandler now.
                     {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
-                            session.audio_flush();
-                            st.flush = NO_FLUSH;
+                        let flush = { let mut st = state.lock().unwrap_or_else(|e| e.into_inner()); let flush = st.flush; st.flush = NO_FLUSH; flush };
+                        if flush != NO_FLUSH {
+                            buffer.lock().await.flush(flush);
+                            session.audio_flush_timed(media.session());
                         }
                     }
 
                     tokio::select! {
+                        biased;
+                        _ = shutdown_rx.changed() => break,
+                        _ = flush_notify.notified() => continue,
                         // Data channel: audio RTP packets.
                         result = dsock.recv_from(&mut data_packet) => {
-                            if let Ok((len, _)) = result
-                                && len >= 12 {
+                            if let Ok((len, addr)) = result
+                                && addr.ip() == remote_sockaddr.ip() && len >= 12 {
                                     let mut buf = buffer.lock().await;
                                     buf.queue(&data_packet[..len], true);
-                                    while let Some(samples) = buf.dequeue(no_resend) {
-                                        {
-                                            #[cfg(feature = "resample")]
-                                            if let Some(ref mut rs) = resampler {
-                                                let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
-                                            } else {
-                                                session.audio_process(samples);
-                                            }
-                                            #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
-                                        }
-                                    }
+
                                 }
                         }
                         // Control channel: retransmit responses (payload type 0x56).
                         result = csock.recv_from(&mut ctrl_packet) => {
-                            if let Ok((len, _)) = result
-                                && len >= 12 && (ctrl_packet[1] & !0x80) == CTRL_PAYLOAD_TYPE {
+                            if let Ok((len, addr)) = result
+                                && addr.ip() == remote_sockaddr.ip() && len >= 12 {
+                                if (ctrl_packet[1] & 0x7f) == 0x54 {
+                                    media.clock.lock().unwrap_or_else(|e| e.into_inner()).sync(&ctrl_packet[..len], format.sample_rate);
+                                } else if (ctrl_packet[1] & 0x7f) == CTRL_PAYLOAD_TYPE {
                                     let mut buf = buffer.lock().await;
                                     // Retransmit packets have a 4-byte header before the original RTP.
                                     if len > RETRANSMIT_HEADER_LEN { buf.queue(&ctrl_packet[RETRANSMIT_HEADER_LEN..len], true); }
                                 }
+                                }
                         }
-                        _ = shutdown_rx.changed() => break,
+                    }
+                    let mut buf = buffer.lock().await;
+                    while let Some(frame) = buf.dequeue_timed(no_resend) {
+                        if let StreamSession::Encoded(encoded) = &mut session {
+                            if let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, audio_timing(&media, &frame, format.sample_rate)); }
+                            continue;
+                        }
+                        let samples = frame.samples;
+                        let timing = audio_timing(&media, &frame, format.sample_rate);
+                        {
+                            #[cfg(feature = "resample")]
+                            if let Some(ref mut rs) = resampler {
+                                let resampled = rs.process(samples);
+                                session.audio_process_timed(&resampled, timing);
+                            } else {
+                                session.audio_process_timed(samples, timing);
+                            }
+                            #[cfg(not(feature = "resample"))]
+                            session.audio_process_timed(samples, timing);
+                        }
                     }
                 }
                 // AudioSession dropped here → triggers cleanup in the app.
-            });
+            })));
         } else {
             // TCP interleaved mode: single connection, `$`-prefixed framing.
             let listener = bind_tcp(SocketAddr::new(rtp_bind_addr(self.local_addr), 0))?;
             self.data_lport = listener.local_addr().map_err(NetworkError::Io)?.port();
 
             let format = self.format;
-            let mut session = self.handler.audio_init(AudioFormat {
-                codec: AudioCodec::Pcm,
-                bits: 32,
-                channels: format.num_channels,
-                sample_rate: self.output_sample_rate.unwrap_or(format.sample_rate),
-            });
+            let mut session = self.create_session()?;
 
             #[cfg(feature = "resample")]
             let mut resampler = make_resampler(
@@ -332,7 +394,9 @@ impl RaopRtp {
             let state = self.state.clone();
             let _remote_for_tcp = self.remote.clone();
 
-            tokio::spawn(async move {
+            let media = self.media.clone();
+            let flush_notify = self.flush_notify.clone();
+            self.children.push(self.tasks.track(tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
                 let mut shutdown_rx = shutdown_rx;
 
@@ -352,15 +416,16 @@ impl RaopRtp {
                 'tcp: loop {
                     // Drain flush events only — metadata goes through AudioHandler now.
                     {
-                        let mut st = state.lock().await;
-                        if st.flush != NO_FLUSH {
-                            buffer.lock().await.flush(st.flush);
-                            session.audio_flush();
-                            st.flush = NO_FLUSH;
+                        let flush = { let mut st = state.lock().unwrap_or_else(|e| e.into_inner()); let flush = st.flush; st.flush = NO_FLUSH; flush };
+                        if flush != NO_FLUSH {
+                            buffer.lock().await.flush(flush);
+                            session.audio_flush_timed(media.session());
                         }
                     }
 
                     tokio::select! {
+                        biased;
+                        _ = flush_notify.notified() => {},
                         result = reader.read(&mut read_buf) => {
                             match result {
                                 Ok(0) | Err(_) => break,
@@ -385,17 +450,20 @@ impl RaopRtp {
                                 if packet_buf.len() < 4 + rtp_len { break; }
                                 let mut buf = buffer.lock().await;
                                 buf.queue(&packet_buf[4..4 + rtp_len], false);
-                                if let Some(samples) = buf.dequeue(true) {
+                                if let Some(frame) = buf.dequeue_timed(true) {
+                                    let samples = frame.samples;
+                                    let timing = audio_timing(&media, &frame, format.sample_rate);
+                                    if let StreamSession::Encoded(encoded) = &mut session && let Some(payload) = frame.encoded { encoded.audio_process_encoded(payload, timing); }
                                     {
                                             #[cfg(feature = "resample")]
                                             if let Some(ref mut rs) = resampler {
                                                 let resampled = rs.process(samples);
-                                                session.audio_process(&resampled);
+                                                session.audio_process_timed(&resampled, timing);
                                             } else {
-                                                session.audio_process(samples);
+                                                session.audio_process_timed(samples, timing);
                                             }
                                             #[cfg(not(feature = "resample"))]
-                                            session.audio_process(samples);
+                                            session.audio_process_timed(samples, timing);
                                         }
                                 }
                                 drop(buf);
@@ -405,18 +473,24 @@ impl RaopRtp {
                         _ = shutdown_rx.changed() => break,
                     }
                 }
-            });
+            })));
         }
 
+        for child in &self.children {
+            self.media.own_transport(child.clone());
+        }
         Ok((self.control_lport, self.timing_lport, self.data_lport))
     }
 
     /// Request a buffer flush up to the given sequence number.
     pub(crate) fn flush(&self, next_seq: i32) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            state.lock().await.flush = next_seq;
-        });
+        self.media
+            .clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset();
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).flush = next_seq;
+        self.flush_notify.notify_one();
     }
 
     /// Stop the receive task and flush the buffer.
@@ -424,6 +498,52 @@ impl RaopRtp {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        self.flush(-1);
+        for child in self.children.drain(..) {
+            child.abort();
+        }
+    }
+}
+
+impl Drop for RaopRtp {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn audio_timing(
+    media: &super::media::MediaContext,
+    frame: &super::buffer::AudioFrame<'_>,
+    rate: u32,
+) -> super::AudioTiming {
+    super::AudioTiming {
+        session: media.session(),
+        sequence: frame.sequence,
+        rtp_timestamp: frame.timestamp,
+        sample_count: frame.sample_count,
+        source_sample_rate: rate,
+        concealed: frame.concealed,
+        presentation_time_ns: media
+            .clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .audio_time(frame.timestamp, rate),
+    }
+}
+
+enum StreamSession {
+    Pcm(Box<dyn super::AudioSession>),
+    Encoded(Box<dyn super::EncodedAudioSession>),
+}
+impl StreamSession {
+    fn audio_process_timed(&mut self, samples: &[f32], timing: super::AudioTiming) {
+        if let Self::Pcm(session) = self {
+            session.audio_process_timed(samples, timing);
+        }
+    }
+    fn audio_flush_timed(&mut self, media: super::MediaSession) {
+        match self {
+            Self::Pcm(session) => session.audio_flush_timed(media),
+            Self::Encoded(session) => session.audio_flush_timed(media),
+        }
     }
 }

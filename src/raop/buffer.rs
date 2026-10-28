@@ -52,6 +52,7 @@ pub(crate) struct StreamFormat {
 
 /// The negotiated wire codec plus its decoder state.
 enum Codec {
+    Encoded(super::EncodedAudioFormat),
     /// Apple Lossless — the classic AirPlay codec. Also covers PipeWire's
     /// `raop.audio.codec=PCM`, which is really uncompressed-ALAC on the wire.
     Alac {
@@ -59,7 +60,9 @@ enum Codec {
         decoder: AlacDecoder,
     },
     /// Raw linear PCM (`L16`): big-endian interleaved S16, no compression.
-    Pcm { config: PcmConfig },
+    Pcm {
+        config: PcmConfig,
+    },
 }
 
 /// Validated codec parameters parsed from the SDP `rtpmap` attribute.
@@ -72,6 +75,7 @@ enum CodecConfig {
 struct BufferEntry {
     /// Whether this slot contains a valid decoded frame.
     available: bool,
+    encoded: Vec<u8>,
     /// RTP flags byte (first byte of RTP header).
     flags: u8,
     /// RTP payload type byte (second byte of RTP header).
@@ -105,6 +109,10 @@ fn parse_fmtp(fmtp: &str) -> Option<AlacConfig> {
     // input and must be rejected, not silently coerced to 0 (a 0 here yields a
     // zero-size audio buffer and a 0-channel decoder downstream).
     let p = |i: usize| vals[i].parse::<u32>().ok();
+    if !(1..=4096).contains(&p(1)?) || !(1..=8).contains(&p(7)?) || !(1..=192000).contains(&p(11)?)
+    {
+        return None;
+    }
     let config = AlacConfig {
         frame_length: p(1)?,
         compatible_version: p(2)? as u8,
@@ -141,7 +149,10 @@ fn parse_l16(encoding: &str) -> Option<PcmConfig> {
         Some(ch) => ch.parse().ok()?,
         None => 1,
     };
-    if parts.next().is_some() || sample_rate == 0 || num_channels == 0 {
+    if parts.next().is_some()
+        || !(1..=192000).contains(&sample_rate)
+        || !(1..=8).contains(&num_channels)
+    {
         return None;
     }
     Some(PcmConfig {
@@ -196,7 +207,24 @@ fn build_decoder_info(config: &AlacConfig) -> [u8; 48] {
 /// ```text
 /// RTP packet → AES-128-CBC decrypt → ALAC or L16 decode → f32 → buffer slot
 /// ```
+/// Decoded frame with original RTP metadata (samples per channel).
+pub struct AudioFrame<'a> {
+    /// Decrypted encoded packet, absent for decoded PCM or concealed loss.
+    pub encoded: Option<&'a [u8]>,
+    /// Interleaved decoded samples.
+    pub samples: &'a [f32],
+    /// Original or inferred sequence number.
+    pub sequence: u16,
+    /// Original or inferred wrapping RTP sample-clock timestamp.
+    pub timestamp: u32,
+    /// Number of samples per channel.
+    pub sample_count: u32,
+    /// True when silence substitutes for a lost packet.
+    pub concealed: bool,
+}
+
 pub struct RaopBuffer {
+    next_timestamp: Option<u32>,
     aes: Option<AesSession>,
     codec: Codec,
     is_empty: bool,
@@ -242,6 +270,28 @@ impl RaopBuffer {
         Self::build(rtpmap, fmtp, None)
     }
 
+    /// Create an encoded-packet buffer; no codec decoder or resampler is involved.
+    pub fn new_encoded(
+        format: super::EncodedAudioFormat,
+        encryption: Option<([u8; 16], [u8; 16])>,
+    ) -> Option<Self> {
+        if format.sample_rate == 0
+            || format.channels == 0
+            || format.samples_per_frame == 0
+            || format.samples_per_frame > 4096
+        {
+            return None;
+        }
+        let mut buffer = Self::new_unencrypted(
+            &format!("96 L16/{}/{}", format.sample_rate, format.channels),
+            "",
+        )?;
+        buffer.silence_samples = format.samples_per_frame as usize * usize::from(format.channels);
+        buffer.aes = encryption.map(|(key, iv)| AesSession { key, iv });
+        buffer.codec = Codec::Encoded(format);
+        Some(buffer)
+    }
+
     fn build(rtpmap: &str, fmtp: &str, aes: Option<AesSession>) -> Option<Self> {
         let (codec, frame_capacity, silence_samples) = match parse_codec(rtpmap)? {
             CodecConfig::Pcm(config) => {
@@ -269,6 +319,7 @@ impl RaopBuffer {
         let entries = (0..RAOP_BUFFER_LENGTH)
             .map(|_| BufferEntry {
                 available: false,
+                encoded: Vec::new(),
                 flags: 0,
                 entry_type: 0,
                 seqnum: 0,
@@ -280,6 +331,7 @@ impl RaopBuffer {
             .collect();
 
         Some(Self {
+            next_timestamp: None,
             aes,
             codec,
             is_empty: true,
@@ -294,6 +346,10 @@ impl RaopBuffer {
     /// Returns the output stream format (channels + source sample rate).
     pub(crate) fn format(&self) -> StreamFormat {
         match &self.codec {
+            Codec::Encoded(format) => StreamFormat {
+                num_channels: format.channels,
+                sample_rate: format.sample_rate,
+            },
             Codec::Alac { config, .. } => StreamFormat {
                 num_channels: config.num_channels,
                 sample_rate: config.sample_rate,
@@ -316,6 +372,16 @@ impl RaopBuffer {
             return -1;
         }
 
+        // This path accepts the fixed RTP header only; never decode extension/CSRC bytes as audio.
+        if data[0] != 0x80 {
+            return -1;
+        }
+        // Bootstrap/no-data packets must not move the reorder window or establish timing.
+        if matches!(self.codec, Codec::Encoded(_))
+            && (datalen == 12 || data[12..] == [0, 0x68, 0x34, 0])
+        {
+            return 0;
+        }
         // Extract sequence number from RTP header bytes 2-3 (big-endian).
         let seqnum = if use_seqnum {
             ((data[2] as u16) << 8) | data[3] as u16
@@ -367,6 +433,10 @@ impl RaopBuffer {
         // Decode into the slot's f32 buffer.
         let capacity = self.frame_capacity;
         let num_samples = match &mut self.codec {
+            Codec::Encoded(format) => {
+                self.entries[idx].encoded = packet_buf.into_owned();
+                format.samples_per_frame as usize * usize::from(format.channels)
+            }
             Codec::Alac { decoder, .. } => {
                 // ALAC decode → S16LE, then convert to f32 samples.
                 let mut s16_buf = vec![0u8; capacity * 2];
@@ -442,6 +512,11 @@ impl RaopBuffer {
     /// to allow time for a retransmit. If `no_resend` is true (or the buffer
     /// is full), substitutes silence for the missing frame.
     pub fn dequeue(&mut self, no_resend: bool) -> Option<&[f32]> {
+        self.dequeue_timed(no_resend).map(|frame| frame.samples)
+    }
+
+    /// Dequeue with original metadata, retaining it through loss concealment.
+    pub fn dequeue_timed(&mut self, no_resend: bool) -> Option<AudioFrame<'_>> {
         let buflen = seqnum_cmp(self.last_seqnum, self.first_seqnum) as i32 + 1;
         if self.is_empty || buflen <= 0 {
             return None;
@@ -453,6 +528,9 @@ impl RaopBuffer {
             return None;
         }
 
+        let sequence = self.first_seqnum;
+        let concealed = !self.entries[idx].available;
+        let channels = u32::from(self.format().num_channels);
         self.first_seqnum = self.first_seqnum.wrapping_add(1);
 
         // Substitute silence for missing frames.
@@ -460,11 +538,39 @@ impl RaopBuffer {
             let size = self.silence_samples.min(self.frame_capacity);
             self.entries[idx].audio_buffer[..size].fill(0.0);
             self.entries[idx].audio_buffer_len = size;
+            // A post-FLUSH gap derives from the next known packet, never stale slot metadata.
+            let timestamp = self.next_timestamp.unwrap_or_else(|| {
+                (1..RAOP_BUFFER_LENGTH)
+                    .find_map(|distance| {
+                        let next = &self.entries[(idx + distance) % RAOP_BUFFER_LENGTH];
+                        next.available.then(|| {
+                            next.timestamp
+                                .wrapping_sub(distance as u32 * size as u32 / channels)
+                        })
+                    })
+                    .unwrap_or(0)
+            });
+            self.entries[idx].timestamp = timestamp;
         }
         self.entries[idx].available = false;
         let len = self.entries[idx].audio_buffer_len;
         self.entries[idx].audio_buffer_len = 0;
-        Some(&self.entries[idx].audio_buffer[..len])
+        let timestamp = self.entries[idx].timestamp;
+        let sample_count = len as u32 / channels;
+        self.next_timestamp = Some(timestamp.wrapping_add(sample_count));
+        let encoded_codec = matches!(self.codec, Codec::Encoded(_));
+        Some(AudioFrame {
+            encoded: (encoded_codec && !concealed).then_some(self.entries[idx].encoded.as_slice()),
+            samples: if encoded_codec {
+                &[]
+            } else {
+                &self.entries[idx].audio_buffer[..len]
+            },
+            sequence,
+            timestamp,
+            sample_count,
+            concealed,
+        })
     }
 
     /// Flush the buffer, discarding all queued frames.
@@ -472,6 +578,7 @@ impl RaopBuffer {
     /// If `next_seq` is a valid 16-bit value (0..=0xFFFF), the buffer resets
     /// to expect that sequence number next. Otherwise the buffer is fully emptied.
     pub fn flush(&mut self, next_seq: i32) {
+        self.next_timestamp = None;
         for entry in &mut self.entries {
             entry.available = false;
             entry.audio_buffer_len = 0;
@@ -479,6 +586,7 @@ impl RaopBuffer {
         if !(0..=0xffff).contains(&next_seq) {
             self.is_empty = true;
         } else {
+            self.is_empty = false;
             self.first_seqnum = next_seq as u16;
             self.last_seqnum = (next_seq as u16).wrapping_sub(1);
         }

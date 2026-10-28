@@ -152,7 +152,7 @@ pub fn parse_announce(buf: &[u8]) -> Option<u64> {
 /// failure it logs one line and returns, leaving normal operation untouched.
 /// IPv6-unspecified bind (AirPlay timing traffic is IPv6). Set `SHAIRPLAY_NO_PTP`
 /// to skip the bind (for A/B measuring the effect).
-pub(crate) async fn spawn_ptp_sink() {
+pub(crate) async fn spawn_ptp_sink(tasks: &crate::raop::media::Tasks) {
     if std::env::var("SHAIRPLAY_NO_PTP").is_ok() {
         tracing::info!("PTP sink disabled via SHAIRPLAY_NO_PTP — expect slow AP2 connect");
         return;
@@ -164,7 +164,7 @@ pub(crate) async fn spawn_ptp_sink() {
             Ok(sock) => {
                 bound += 1;
                 let seen = seen.clone();
-                tokio::spawn(async move {
+                tasks.track(tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
                     loop {
                         match sock.recv_from(&mut buf).await {
@@ -175,7 +175,7 @@ pub(crate) async fn spawn_ptp_sink() {
                             }
                         }
                     }
-                });
+                }));
             }
             Err(e) => tracing::warn!(
                 port,

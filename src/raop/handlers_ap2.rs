@@ -34,7 +34,7 @@ impl RaopConnection {
         event_channel_cipher: crate::crypto::chacha_transport::EncryptedChannel,
         rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     ) {
-        tokio::spawn(async move {
+        self.own(tokio::spawn(async move {
             if let Ok((stream, addr)) = event_listener.accept().await {
                 tracing::info!(%addr, "RC event channel client connected");
                 crate::raop::event_channel::EventChannel::handle_stream(
@@ -44,8 +44,77 @@ impl RaopConnection {
                 )
                 .await;
             }
-        });
+        }));
     }
+}
+
+/// Legacy Apple-TV PIN exchange (binary plist, SRP SHA1 followed by AES-GCM).
+pub(crate) fn handle_pair_setup_pin(
+    conn: &mut RaopConnection,
+    request: &HttpRequest,
+    response: &mut HttpResponse,
+) -> Option<Vec<u8>> {
+    use crate::crypto::pairing_pin::PinSetup;
+    let result = (|| {
+        let pin = conn.shared.pin.as_deref()?;
+        let data = request.data().filter(|body| body.len() <= 4096)?;
+        let value: plist::Value = plist::from_bytes(data).ok()?;
+        let dict = value.as_dictionary()?;
+        let mut reply = plist::Dictionary::new();
+        match (
+            dict.get("method").and_then(plist::Value::as_string),
+            dict.get("user").and_then(plist::Value::as_string),
+            dict.get("pk").and_then(plist::Value::as_data),
+            dict.get("proof").and_then(plist::Value::as_data),
+            dict.get("epk").and_then(plist::Value::as_data),
+            dict.get("authTag").and_then(plist::Value::as_data),
+        ) {
+            (Some("pin"), Some(user), None, None, None, None) => {
+                let setup = PinSetup::new(user, pin, conn.shared.pairing.public_key()).ok()?;
+                let (salt, pk) = setup.challenge();
+                reply.insert("salt".into(), plist::Value::Data(salt.to_vec()));
+                reply.insert("pk".into(), plist::Value::Data(pk));
+                conn.pin_setup = Some(setup);
+            }
+            (None, None, Some(pk), Some(proof), None, None) => {
+                let proof = conn.pin_setup.as_mut()?.verify(pk, proof).ok()?;
+                reply.insert("proof".into(), plist::Value::Data(proof.to_vec()));
+            }
+            (None, None, None, None, Some(epk), Some(tag)) => {
+                let confirmation = conn.pin_setup.take()?.finish(epk, tag).ok()?;
+                drop(confirmation.user);
+                conn.shared.pairing_store.put(
+                    &super::handlers_ap1::legacy_pairing_id(&confirmation.peer_public_key),
+                    confirmation.peer_public_key,
+                );
+                conn.authenticated_peer = Some(confirmation.peer_public_key);
+                reply.insert(
+                    "epk".into(),
+                    plist::Value::Data(confirmation.encrypted_public_key.to_vec()),
+                );
+                reply.insert(
+                    "authTag".into(),
+                    plist::Value::Data(confirmation.auth_tag.to_vec()),
+                );
+            }
+            _ => return None,
+        }
+        response.set_plist_body(&reply)
+    })();
+    if result.is_none() {
+        conn.pin_setup = None;
+        *response = super::rtsp::new_response(
+            470,
+            "Client Authentication Failure",
+            request.header("CSeq").unwrap_or("0"),
+        );
+        conn.shared
+            .handler
+            .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                "legacy PIN authentication failed".into(),
+            )));
+    }
+    result
 }
 
 #[cfg(feature = "ap2")]
@@ -104,6 +173,7 @@ pub(crate) fn handle_pair_setup(
                         .build_m6(&conn.shared.device_id, &conn.shared.identity_seed)
                         .ok()?;
                     conn.shared.pairing_store.put(&client_id, client_pk);
+                    conn.authenticated_peer = Some(client_pk);
                     tracing::info!(
                         client_id,
                         "AP2 normal pair-setup complete, client key stored"
@@ -235,10 +305,14 @@ pub(crate) fn handle_info(
     dict.insert(
         "statusFlags".into(),
         plist::Value::Integer(
-            (config::ap2_status_flags(
-                conn.shared.pin.is_some(),
-                conn.shared.pairing_store.has_any_pairing(),
-            ) as i64)
+            (if cfg!(feature = "video") && conn.shared.pin.is_some() {
+                68
+            } else {
+                config::ap2_status_flags(
+                    conn.shared.pin.is_some(),
+                    conn.shared.pairing_store.has_any_pairing(),
+                )
+            } as i64)
                 .into(),
         ),
     );
@@ -250,11 +324,11 @@ pub(crate) fn handle_info(
         let display = plist::Dictionary::from_iter([
             (
                 "widthPixels".to_string(),
-                plist::Value::Integer(config::MIRRORING_WIDTH.into()),
+                plist::Value::Integer(conn.shared.video_display.0.into()),
             ),
             (
                 "heightPixels".to_string(),
-                plist::Value::Integer(config::MIRRORING_HEIGHT.into()),
+                plist::Value::Integer(conn.shared.video_display.1.into()),
             ),
             (
                 "uuid".to_string(),
@@ -262,7 +336,7 @@ pub(crate) fn handle_info(
             ),
             (
                 "maxFPS".to_string(),
-                plist::Value::Integer(config::MIRRORING_FPS.into()),
+                plist::Value::Integer(conn.shared.video_display.2.into()),
             ),
             (
                 "features".to_string(),
@@ -347,41 +421,56 @@ pub(crate) fn handle_setup(
     request: &HttpRequest,
     response: &mut HttpResponse,
 ) -> Option<Vec<u8>> {
-    let data = request.data()?;
-    let plist_val: plist::Value = plist::from_bytes(data).ok()?;
-    let dict = plist_val.as_dictionary()?;
-    let keys: Vec<_> = dict.keys().collect();
-    let has_streams = dict.get("streams").is_some();
-    let is_mirror = dict
-        .get("isScreenMirroringSession")
-        .and_then(|v| v.as_boolean())
-        .unwrap_or(false);
-    let has_ekey = dict.get("ekey").is_some();
-    let timing = dict
-        .get("timingProtocol")
-        .and_then(|v| v.as_string())
-        .unwrap_or("");
-    tracing::info!(
-        ?keys,
-        has_streams,
-        is_mirror,
-        has_ekey,
-        timing,
-        "SETUP plist"
-    );
+    let result = (|| {
+        let data = request.data()?;
+        let plist_val: plist::Value = plist::from_bytes(data).ok()?;
+        let dict = plist_val.as_dictionary()?;
+        let keys: Vec<_> = dict.keys().collect();
+        let has_streams = dict.get("streams").is_some();
+        let is_mirror = dict
+            .get("isScreenMirroringSession")
+            .and_then(|v| v.as_boolean())
+            .unwrap_or(false);
+        let has_ekey = dict.get("ekey").is_some();
+        let timing = dict
+            .get("timingProtocol")
+            .and_then(|v| v.as_string())
+            .unwrap_or("");
+        tracing::info!(
+            ?keys,
+            has_streams,
+            is_mirror,
+            has_ekey,
+            timing,
+            "SETUP plist"
+        );
 
-    let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
-        setup_streams(conn, streams)?
-    } else {
-        setup_initial(conn, dict)?
-    };
+        if !conn.admit_media() {
+            return None;
+        }
+        let resp_dict = if let Some(streams) = dict.get("streams").and_then(|v| v.as_array()) {
+            setup_streams(conn, streams)?
+        } else {
+            setup_initial(conn, dict)?
+        };
 
-    response.set_plist_body(&resp_dict)
+        response.set_plist_body(&resp_dict)
+    })();
+    if result.is_none() {
+        *response = HttpResponse::new("RTSP/1.0", 400, "Bad Request");
+        if let Some(cseq) = request.header("CSeq") {
+            response.add_header("CSeq", cseq);
+        }
+    }
+    result
 }
 
 #[cfg(feature = "ap2")]
 /// Stream SETUP (`streams` present): dispatch by stream type, then add the shared control port.
-fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<plist::Dictionary> {
+pub(crate) fn setup_streams(
+    conn: &mut RaopConnection,
+    streams: &[plist::Value],
+) -> Option<plist::Dictionary> {
     // Stream SETUP — type 96 (realtime) or type 103 (buffered) or type 110 (video)
     let stream0 = streams.first()?.as_dictionary()?;
     let stream_type = stream0.get("type")?.as_unsigned_integer()?;
@@ -402,15 +491,6 @@ fn setup_streams(conn: &mut RaopConnection, streams: &[plist::Value]) -> Option<
             tracing::warn!(stream_type, "Unknown AP2 stream type");
         }
     }
-
-    // Control port (shared across streams)
-    let ctrl_sock = std::net::UdpSocket::bind(bind_addr_for(conn)).ok()?;
-    let ctrl_port = ctrl_sock.local_addr().ok()?.port();
-    drop(ctrl_sock);
-    stream_resp.insert(
-        "controlPort".into(),
-        plist::Value::Integer(ctrl_port.into()),
-    );
 
     let mut resp_dict = plist::Dictionary::new();
     resp_dict.insert(
@@ -441,28 +521,24 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
         {
             match conn.fairplay.decrypt(&input) {
                 Ok(fp_key) => {
-                    // SHA-512 two-step: hash FairPlay key with ECDH shared secret
-                    // Stage 2: hash with ECDH only if AP2 pairing was used.
-                    // With UxPlay-style features (bit 27 off), no pairing occurs
-                    // and the raw FairPlay key is used directly.
-                    let derived = if let Some(ref secret) = conn.ap2_shared_secret {
+                    // Verified legacy pairing uses the same SHA512(FairPlay key || ECDH) seed.
+                    let secret = conn
+                        .pairing
+                        .shared_secret()
+                        .map(|key| key.as_slice())
+                        .or(conn.ap2_shared_secret.as_deref());
+                    let derived = if let Some(secret) = secret {
                         use sha2::{Digest, Sha512};
                         let mut hasher = Sha512::new();
                         hasher.update(fp_key);
                         hasher.update(secret);
-                        let hash = hasher.finalize();
                         let mut key = [0u8; 16];
-                        key.copy_from_slice(&hash[..16]);
+                        key.copy_from_slice(&hasher.finalize()[..16]);
                         key
                     } else {
                         fp_key
                     };
                     conn.ekey = Some(derived);
-                    // Store in shared state for the video connection
-                    if let Ok(mut shared) = conn.shared.video_ekey.write() {
-                        *shared = Some(derived);
-                        tracing::debug!("Video ekey stored in shared state");
-                    }
                 }
                 Err(e) => {
                     tracing::warn!("FairPlay decrypt failed: {e:?}");
@@ -474,9 +550,8 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             && let Ok(iv) = <[u8; 16]>::try_from(eiv_data)
         {
             conn.eiv = Some(iv);
-            if let Ok(mut shared) = conn.shared.video_eiv.write() {
-                *shared = Some(iv);
-                tracing::debug!("Video eiv stored in shared state");
+            if let Some(key) = conn.ekey {
+                *conn.media.keys.write().ok()? = Some((key, iv));
             }
         }
     }
@@ -561,17 +636,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
             }
 
             let sender = crate::raop::event_channel::EventSender::from_tx(tx);
-            tokio::spawn(async move {
-                if let Ok((stream, addr)) = event_listener.accept().await {
-                    tracing::info!(%addr, "Event channel client connected");
-                    crate::raop::event_channel::EventChannel::handle_stream(
-                        stream,
-                        event_channel_cipher,
-                        rx,
-                    )
-                    .await;
-                }
-            });
+            conn.spawn_event_channel(event_listener, event_channel_cipher, rx);
             sender
         };
         conn.event_sender = Some(event_sender);
@@ -592,7 +657,7 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
     // The iPhone needs NTP sync before it sends the stream SETUP.
     // RaopRtp is created later in the stream SETUP with real ALAC parameters.
     #[cfg(feature = "video")]
-    let timing_port = if !conn.is_ap2 && conn.ekey.is_some() {
+    let timing_port = if timing == "NTP" {
         let timing_rport = dict
             .get("timingPort")
             .and_then(|v| v.as_unsigned_integer())
@@ -602,7 +667,11 @@ fn setup_initial(conn: &mut RaopConnection, dict: &plist::Dictionary) -> Option<
                 let local_port = tsock.local_addr().ok()?.port();
                 let mut remote_timing = conn.remote_socket;
                 remote_timing.set_port(timing_rport);
-                crate::raop::ntp::spawn_ntp_responder(tsock, remote_timing);
+                conn.own_media(crate::raop::ntp::spawn_ntp_responder(
+                    tsock,
+                    remote_timing,
+                    conn.media.clone(),
+                ));
                 Some(local_port)
             })
             .unwrap_or(0);
@@ -637,10 +706,19 @@ fn setup_stream_realtime(
         .get("spf")
         .and_then(|v| v.as_unsigned_integer())
         .unwrap_or(352);
+    if !(1..=192000).contains(&sr) || !(1..=4096).contains(&spf) {
+        conn.shared
+            .handler
+            .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                "realtime audio format exceeds supported bounds".into(),
+            )));
+        return None;
+    }
     let audio_format = stream0
         .get("audioFormat")
         .and_then(|v| v.as_unsigned_integer())
-        .unwrap_or(0) as u32;
+        .unwrap_or(0);
+    let audio_format = u32::try_from(audio_format).ok()?;
     let alac_format = AlacFormat::from_audio_format(audio_format).unwrap_or(AlacFormat {
         sample_rate: sr as u32,
         bit_depth: 16,
@@ -687,8 +765,10 @@ fn setup_stream_realtime(
             handler,
             output_config,
         ));
+        let abort = handle.abort_handle();
+        conn.own_media(handle);
         conn.shared
-            .set_active_audio(Box::new(move || handle.abort()));
+            .set_active_audio(Box::new(move || abort.abort()));
 
         stream_resp.insert("dataPort".into(), plist::Value::Integer(audio_port.into()));
     } else {
@@ -701,12 +781,42 @@ fn setup_stream_realtime(
                 "Legacy ALAC (AES-CBC via ekey)"
             );
 
-            let aes_key = conn.ekey.unwrap_or([0u8; 16]);
-            let aes_iv = conn.eiv.unwrap_or([0u8; 16]);
+            let (aes_key, aes_iv) = conn
+                .ekey
+                .zip(conn.eiv)
+                .or_else(|| *conn.media.keys.read().ok()?)?;
+            let ct = stream0
+                .get("ct")
+                .and_then(|v| v.as_unsigned_integer())
+                .unwrap_or(2);
+            let encoded_format = match ct {
+                2 => None,
+                8 if sr == 44100 && spf == 480 => Some(super::EncodedAudioFormat {
+                    codec: super::WireAudioCodec::AacEld,
+                    sample_rate: 44100,
+                    channels: 2,
+                    samples_per_frame: 480,
+                    codec_config: vec![0xf8, 0xe8, 0x50, 0],
+                }),
+                _ => {
+                    conn.shared.handler.on_error(&ShairplayError::Protocol(
+                        ProtocolError::InvalidRtsp(format!(
+                            "unsupported legacy codec/format ct={ct} sr={sr} spf={spf}"
+                        )),
+                    ));
+                    return None;
+                }
+            };
+            if sr == 0 || sr > 192000 || spf == 0 || spf > 4096 {
+                return None;
+            }
             let fmtp = format!("96 {spf} 0 16 40 10 14 2 255 0 0 {sr}");
-            conn.raop_rtp = RaopRtp::new(
+            let mut staged_rtp = RaopRtp::new(
                 conn.shared.handler.clone(),
                 crate::raop::rtp::RtpConfig {
+                    encoded_format: encoded_format.clone(),
+                    media: conn.media.clone(),
+                    tasks: conn.shared.tasks.clone(),
                     remote: conn.remote_socket.ip().to_string(),
                     local_addr: local_ip_from(conn),
                     rtpmap: "96 AppleLossless".to_string(),
@@ -719,14 +829,21 @@ fn setup_stream_realtime(
                     remote_socket: conn.remote_socket,
                 },
             );
-            if let Some(rtp) = &mut conn.raop_rtp {
+            if let Some(rtp) = &mut staged_rtp {
                 let control_port = stream0
                     .get("controlPort")
                     .and_then(|v| v.as_unsigned_integer())
                     .unwrap_or(0) as u16;
-                let (cport, _tport, dport) = rtp.start(true, control_port, 0).ok()?;
+                let (cport, _tport, dport) = match rtp.start(true, control_port, 0) {
+                    Ok(ports) => ports,
+                    Err(error) => {
+                        conn.shared.handler.on_error(&error);
+                        return None;
+                    }
+                };
                 stream_resp.insert("dataPort".into(), plist::Value::Integer(dport.into()));
                 stream_resp.insert("controlPort".into(), plist::Value::Integer(cport.into()));
+                conn.raop_rtp = staged_rtp;
             }
         }
         #[cfg(not(feature = "video"))]
@@ -787,7 +904,8 @@ fn setup_stream_buffered(
     };
 
     let proc = crate::raop::buffered_audio::BufferedAudioProcessor { listener };
-    let cmd_tx = proc.start(shk_arr, output_config, handler);
+    let (cmd_tx, task) = proc.start(shk_arr, output_config, handler);
+    conn.own_media(task);
     conn.playout_cmd = Some(cmd_tx.clone());
     conn.shared.set_active_audio(Box::new(move || {
         let _ = cmd_tx.send(crate::raop::buffered_audio::PlayoutCommand::Stop);
@@ -817,11 +935,11 @@ fn setup_stream_rc(
         let data_port = data_listener.local_addr().ok()?.port();
         tracing::debug!(data_port, "RC data channel opened");
 
-        tokio::spawn(async move {
+        conn.own(tokio::spawn(async move {
             if let Ok((_, addr)) = data_listener.accept().await {
                 tracing::info!(%addr, "RC data channel client connected");
             }
-        });
+        }));
 
         stream_resp.insert("streamID".into(), plist::Value::Integer(1_i64.into()));
         stream_resp.insert("dataPort".into(), plist::Value::Integer(data_port.into()));
@@ -839,10 +957,19 @@ fn setup_stream_video(
     stream0: &plist::Dictionary,
     stream_resp: &mut plist::Dictionary,
 ) -> Option<()> {
-    let stream_connection_id = stream0
-        .get("streamConnectionID")
-        .and_then(|v| v.as_signed_integer())
-        .unwrap_or(0) as u64;
+    let stream_connection_id = stream0.get("streamConnectionID").and_then(|value| {
+        value
+            .as_unsigned_integer()
+            .or_else(|| value.as_signed_integer().map(|id| id as u64))
+    });
+    let Some(stream_connection_id) = stream_connection_id else {
+        conn.shared
+            .handler
+            .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                "video SETUP requires an integer streamConnectionID".into(),
+            )));
+        return None;
+    };
     tracing::info!(
         stream_type = 110,
         stream_connection_id,
@@ -853,21 +980,22 @@ fn setup_stream_video(
     // eaesKey = SHA-512(fairplay_key ‖ ecdh) (full FairPlay + ECDH path).
     let (ekey, eiv) = if let Some(aeskey_audio) = conn
         .ekey
-        .or_else(|| conn.shared.video_ekey.read().ok()?.as_ref().copied())
+        .or_else(|| conn.media.keys.read().ok()?.map(|keys| keys.0))
     {
         tracing::debug!("Video key: Stage 3 derivation from aeskey_audio");
         crate::crypto::video_key::derive_stream_key_iv(&aeskey_audio, stream_connection_id)
     } else if let Some(ecdh) = conn.pair_verify_secret.as_ref() {
-        let fp_key = conn.shared.video_ekey.read().ok().and_then(|k| *k);
+        let fp_key = conn
+            .media
+            .keys
+            .read()
+            .ok()
+            .and_then(|k| k.map(|keys| keys.0));
         if let Some(fp_key) = fp_key {
             let eaes_key = crate::crypto::video_key::derive_eaes_key(&fp_key, ecdh);
             let (key, iv) =
                 crate::crypto::video_key::derive_stream_key_iv(&eaes_key, stream_connection_id);
-            tracing::debug!(
-                derived_key = %hex::encode(key),
-                derived_iv = %hex::encode(iv),
-                "Video key: 3-step derivation (FairPlay + ECDH)"
-            );
+            tracing::debug!("Video key: 3-step derivation (FairPlay + ECDH)");
             (key, iv)
         } else {
             // iOS 18+ with HomeKit pairing does not send ekey; derivation is unsolved
@@ -899,10 +1027,25 @@ fn setup_stream_video(
     let video_port = listener.local_addr().ok()?.port();
     tracing::info!(video_port, "Video stream TCP port opened");
 
-    if let Some(vh) = &conn.shared.video_handler {
-        let session = vh.video_init();
-        tokio::spawn(crate::raop::video_stream::run(listener, cipher, session));
-    }
+    let vh = conn.shared.video_handler.clone()?;
+    let Some(lease) = conn.media.video_lease() else {
+        conn.shared
+            .handler
+            .on_error(&ShairplayError::Protocol(ProtocolError::InvalidRtsp(
+                "a video transport is already active; retry after it closes".into(),
+            )));
+        return None;
+    };
+    conn.media.attach_handler(conn.shared.handler.clone());
+    let session = vh.video_init_timed(conn.media.session());
+    conn.own(tokio::spawn(crate::raop::video_stream::run(
+        listener,
+        cipher,
+        session,
+        conn.media.clone(),
+        conn.remote_socket.ip(),
+        lease,
+    )));
 
     stream_resp.insert("dataPort".into(), plist::Value::Integer(video_port.into()));
     Some(())

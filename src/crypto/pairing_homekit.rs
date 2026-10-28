@@ -575,6 +575,7 @@ pub(crate) fn pairing_error_response(state: u8) -> Vec<u8> {
 
 /// Server-side pair-verify using Curve25519 ECDH + Ed25519 signatures.
 pub(crate) struct PairVerifyServer {
+    verified_peer: Option<[u8; 32]>,
     device_id: String,
     server_sk: SigningKey,
     server_eph_sk: [u8; 32],
@@ -585,6 +586,9 @@ pub(crate) struct PairVerifyServer {
 }
 
 impl PairVerifyServer {
+    pub(crate) fn verified_peer(&self) -> Option<[u8; 32]> {
+        self.verified_peer
+    }
     /// Create a new pair-verify server for the given device ID.
     ///
     /// `device_id` is the public accessory identifier; M2 is signed with the
@@ -599,6 +603,7 @@ impl PairVerifyServer {
         let eph_pk = x25519_dalek::PublicKey::from(&static_secret);
 
         Self {
+            verified_peer: None,
             device_id: device_id.to_string(),
             server_sk: sk,
             server_eph_sk: eph_sk_bytes,
@@ -712,6 +717,7 @@ impl PairVerifyServer {
             })?);
             vk.verify(&info, &sig)
                 .map_err(|_| CryptoError::PairingVerify)?;
+            self.verified_peer = Some(ltpk);
             tracing::info!("Pair-verify: client signature verified");
         } else {
             // No key lookup provided → client signature is NOT verified. This is only

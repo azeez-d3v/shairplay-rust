@@ -654,14 +654,28 @@ mod ap2_tests {
         };
 
         let expected_features = if cfg!(feature = "video") {
-            "0x527FFEE6,0x0"
+            "0x5A7FFEE6,0x0"
         } else {
             "0x405D4A00,0x14340"
         };
         assert_eq!(raop("ft"), Some(expected_features));
-        assert_eq!(raop("sf"), Some("0x204"));
+        assert_eq!(
+            raop("sf"),
+            Some(if cfg!(feature = "video") {
+                "0x8C"
+            } else {
+                "0x204"
+            })
+        );
         assert_eq!(airplay("features"), Some(expected_features));
-        assert_eq!(airplay("flags"), Some("0x204"));
+        assert_eq!(
+            airplay("flags"),
+            Some(if cfg!(feature = "video") {
+                "0x4"
+            } else {
+                "0x204"
+            })
+        );
     }
 
     #[tokio::test]

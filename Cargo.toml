@@ -58,6 +58,7 @@ plist = "1.9"
 
 # AirPlay 2 (optional)
 chacha20poly1305 = { version = "0.10", optional = true }
+aes-gcm = { version = "0.10", optional = true }
 hkdf = { version = "0.12", optional = true }
 num-bigint = { version = "0.4", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
@@ -84,7 +85,7 @@ pipewire-auth-setup-compat = []
 diagnostic-headers = []
 dangerous-raw-headers = ["diagnostic-headers"]
 resample = ["dep:rubato"]
-ap2 = ["resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:symphonia"]
+ap2 = ["dep:aes-gcm", "resample", "dep:chacha20poly1305", "dep:hkdf", "dep:num-bigint", "dep:uuid", "dep:symphonia"]
 video = ["ap2"]
 hls = ["video"]
 

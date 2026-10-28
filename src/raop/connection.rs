@@ -15,6 +15,11 @@ use std::sync::Arc;
 
 /// Shared state passed to each connection.
 pub(crate) struct RaopShared {
+    #[cfg(feature = "video")]
+    pub(crate) video_display: (u32, u32, u32),
+    pub(crate) tasks: Arc<super::media::Tasks>,
+    #[cfg_attr(not(feature = "ap2"), allow(dead_code))]
+    pub(crate) media: std::sync::Mutex<super::media::MediaRegistry>,
     pub(crate) rsakey: Arc<RsaKey>,
     pub(crate) pairing: Arc<Pairing>,
     pub(crate) hwaddr: Vec<u8>,
@@ -35,11 +40,6 @@ pub(crate) struct RaopShared {
     pub(crate) pin: Option<String>,
     #[cfg(feature = "video")]
     pub(crate) video_handler: Option<Arc<dyn crate::raop::video::VideoHandler>>,
-    /// Shared video encryption keys — set by audio SETUP, read by video SETUP.
-    #[cfg(feature = "video")]
-    pub(crate) video_ekey: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
-    #[cfg(feature = "video")]
-    pub(crate) video_eiv: Arc<std::sync::RwLock<Option<[u8; 16]>>>,
     #[cfg(feature = "ap2")]
     pub(crate) pairing_id: String,
     /// Accessory device id (`hwaddr_airplay(hwaddr)`), computed once at build.
@@ -80,12 +80,14 @@ fn socket_ip_bytes(address: SocketAddr) -> Vec<u8> {
     }
 }
 
-fn new_raop_connection(
+pub(crate) fn new_raop_connection(
     shared: Arc<RaopShared>,
     local: SocketAddr,
     remote: SocketAddr,
 ) -> handlers::RaopConnection {
     handlers::RaopConnection {
+        media: Arc::new(super::media::MediaContext::default()),
+        children: Vec::new(),
         raop_rtp: None,
         fairplay: FairPlay::new(),
         pairing: shared.pairing.create_session(),
@@ -95,6 +97,10 @@ fn new_raop_connection(
         nonce: digest::generate_nonce(MAX_NONCE_LEN),
         #[cfg(feature = "ap2")]
         srp_server: None,
+        #[cfg(feature = "ap2")]
+        pin_setup: None,
+        #[cfg(feature = "ap2")]
+        authenticated_peer: None,
         #[cfg(feature = "ap2")]
         pair_verify: None,
         #[cfg(feature = "ap2")]

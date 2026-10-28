@@ -67,6 +67,15 @@ pub struct PairingSession {
 }
 
 impl PairingSession {
+    #[cfg(feature = "video")]
+    pub(crate) fn shared_secret(&self) -> Option<&[u8; 32]> {
+        (self.status == Status::Finished).then_some(&self.ecdh_secret)
+    }
+
+    #[cfg(feature = "ap2")]
+    pub(crate) fn verified_peer(&self) -> Option<[u8; 32]> {
+        (self.status == Status::Finished).then_some(self.ed_theirs)
+    }
     fn derive_key_internal(&self, salt: &[u8], key_len: usize) -> Result<Vec<u8>, CryptoError> {
         if key_len > 64 {
             return Err(CryptoError::PairingHandshake("key_len > 64".into()));

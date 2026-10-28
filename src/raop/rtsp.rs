@@ -80,6 +80,12 @@ const ROUTES: &[Route] = &[
     #[cfg(feature = "ap2")]
     Route {
         method: "POST",
+        path: "/pair-setup-pin",
+        handler: handlers_ap2::handle_pair_setup_pin,
+    },
+    #[cfg(feature = "ap2")]
+    Route {
+        method: "POST",
         path: "/pair-setup",
         handler: handlers_ap2::handle_pair_setup,
     },
@@ -352,8 +358,7 @@ fn resolve_record(conn: &RaopConnection) -> Option<Handler> {
 /// FLUSH: parse RTP-Info header and flush the buffer inline.
 fn handle_flush_inline(conn: &mut RaopConnection, request: &HttpRequest) {
     if let Some(rtp_info) = request.header("RTP-Info")
-        && let Some(seq_str) = rtp_info.strip_prefix("seq=")
-        && let Ok(next_seq) = seq_str.parse::<i32>()
+        && let Some(next_seq) = super::ntp::parse_flush_sequence(rtp_info)
         && let Some(rtp) = &conn.raop_rtp
     {
         rtp.flush(next_seq);

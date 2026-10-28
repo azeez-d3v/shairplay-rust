@@ -238,6 +238,7 @@ pub(crate) trait ConnectionHandler: Send {
 
 /// Async TCP server supporting IPv4 and IPv6. Equivalent to httpd_t.
 pub(crate) struct HttpServer {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
     callbacks: Arc<dyn HttpdCallbacks>,
     max_connections: usize,
     shutdown_tx: Option<watch::Sender<bool>>,
@@ -251,6 +252,7 @@ impl HttpServer {
     /// Create a new HTTP server with the given callbacks and connection limit.
     pub(crate) fn new(callbacks: Arc<dyn HttpdCallbacks>, max_connections: usize) -> Self {
         Self {
+            tasks: Vec::new(),
             callbacks,
             max_connections,
             shutdown_tx: None,
@@ -325,13 +327,13 @@ impl HttpServer {
             if let Ok(addr) = listener.local_addr() {
                 tracing::debug!(%addr, "Listener bound");
             }
-            spawn_accept_loop(
+            self.tasks.push(spawn_accept_loop(
                 listener,
                 callbacks.clone(),
                 semaphore.clone(),
                 shutdown_rx.clone(),
                 connection_config,
-            );
+            ));
         }
 
         Ok(actual_port)
@@ -351,6 +353,9 @@ impl HttpServer {
     pub(crate) async fn stop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
+        }
+        for task in self.tasks.drain(..) {
+            let _ = task.await;
         }
         self.running = false;
     }
@@ -540,9 +545,13 @@ fn spawn_accept_loop(
     semaphore: Arc<Semaphore>,
     mut shutdown_rx: watch::Receiver<bool>,
     config: ConnectionConfig,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut children = tokio::task::JoinSet::new();
         loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, remote) = match result {
@@ -559,7 +568,7 @@ fn spawn_accept_loop(
                         Err(_) => { tracing::warn!("Max connections reached"); continue; }
                     };
                     let cb = callbacks.clone();
-                    tokio::spawn(async move {
+                    children.spawn(async move {
                         let _permit = permit;
                         let handler = match cb.conn_init(local, remote) {
                             Some(h) => h,
@@ -568,20 +577,31 @@ fn spawn_accept_loop(
                         process_connection(stream, handler, remote, config).await;
                     });
                 }
+                _ = children.join_next(), if !children.is_empty() => {}
                 _ = shutdown_rx.changed() => {
                     break;
                 }
             }
         }
-    });
+        children.abort_all();
+        while children.join_next().await.is_some() {}
+    })
+}
+
+impl Drop for HttpServer {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct OkHandler {
-        disconnect: bool,
+    pub(super) struct OkHandler {
+        pub(super) disconnect: bool,
     }
     impl ConnectionHandler for OkHandler {
         fn conn_request(&mut self, _req: &HttpRequest) -> HttpResponse {
@@ -681,5 +701,46 @@ mod tests {
         client.write_all(b"encrypted").await.unwrap();
         drop(client);
         task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod owned_stop_tests {
+    use super::*;
+    struct Callbacks;
+    impl HttpdCallbacks for Callbacks {
+        fn conn_init(
+            self: Arc<Self>,
+            _: SocketAddr,
+            _: SocketAddr,
+        ) -> Option<Box<dyn ConnectionHandler>> {
+            Some(Box::new(super::tests::OkHandler { disconnect: false }))
+        }
+    }
+    #[tokio::test]
+    async fn stop_closes_accepted_connection_and_listener() {
+        let mut server = HttpServer::new(Arc::new(Callbacks), 4);
+        server.set_bind_config(
+            BindConfig::new()
+                .addrs(["127.0.0.1".parse().unwrap()])
+                .port(0),
+        );
+        let port = server.start(0).await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        client
+            .write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0; 1024];
+        assert!(client.read(&mut buf).await.unwrap() > 0);
+        server.stop().await;
+        let read = tokio::time::timeout(Duration::from_millis(200), client.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "accepted socket survived stop"
+        );
+        assert!(TcpListener::bind(("127.0.0.1", port)).await.is_ok());
     }
 }
